@@ -87,18 +87,37 @@ jobs:
     needs: release
     runs-on: ubuntu-latest
     steps:
-      - name: Verify updater metadata
+      - name: Normalize updater metadata
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          release_id="$(gh api "repos/${{ github.repository }}/releases/tags/$GITHUB_REF_NAME" --jq .id)"
+          gh api "repos/${{ github.repository }}/releases/$release_id/assets?per_page=100" > release-assets.json
           gh release download "$GITHUB_REF_NAME" --repo "${{ github.repository }}" --pattern latest.json --dir release
+          jq --slurpfile assets release-assets.json '
+            .platforms |= with_entries(
+              .value.url as $url |
+              .value.url = ([$assets[0][] | select(.url == $url) | .browser_download_url][0] // $url)
+            )
+          ' release/latest.json > release/latest.normalized.json
+          mv release/latest.normalized.json release/latest.json
+          gh release upload "$GITHUB_REF_NAME" release/latest.json --repo "${{ github.repository }}" --clobber
+      - name: Verify updater metadata
+        run: |
+          version="${GITHUB_REF_NAME#v}"
           jq -e '
             .version == $version and
-            (.platforms["darwin-aarch64"] | .url != "" and .signature != "") and
-            (.platforms["darwin-x86_64"] | .url != "" and .signature != "") and
-            (.platforms["windows-x86_64"] | .url != "" and .signature != "")
+            (.platforms as $platforms |
+              ["darwin-aarch64", "darwin-x86_64", "windows-x86_64"] |
+              all(.[];
+                . as $platform |
+                ($platforms[$platform].url | startswith("https://github.com/${{ github.repository }}/releases/download/")) and
+                ($platforms[$platform].signature != "")
+              )
+            )
           ' --arg version "$version" release/latest.json
+          jq -r '.platforms | [."darwin-aarch64", ."darwin-x86_64", ."windows-x86_64"] | .[].url' release/latest.json |
+            while read -r url; do curl --fail --location --head "$url"; done
       - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
