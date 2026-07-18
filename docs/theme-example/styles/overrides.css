@@ -1,0 +1,47 @@
+:root[data-ct-theme="studio.example.protocol-preview"] [data-ct-slot="app.shell"],
+:root[data-ct-theme="studio.example.protocol-preview"] [data-ct-slot="main"],
+:root[data-ct-theme="studio.example.protocol-preview"] [data-ct-slot="main.background"],
+:root[data-ct-theme="studio.example.protocol-preview"] [data-ct-slot="settings.canvas"] {
+  background: var(--rt-page-background) !important;
+  color: var(--rt-text) !important;
+}
+:root[data-ct-theme="studio.example.protocol-preview"] [data-ct-slot="sidebar"] {
+  background: var(--rt-sidebar-background) !important;
+  border-right: 1px solid var(--rt-border) !important;
+  box-shadow: none !important;
+}
+
+:root[data-ct-theme="studio.example.protocol-preview"] [data-ct-slot="sidebar.item.active"] {
+  background: var(--rt-accent-soft) !important;
+  color: var(--rt-accent) !important;
+}
+
+:root[data-ct-theme="studio.example.protocol-preview"] [data-ct-slot="home.card"],
+:root[data-ct-theme="studio.example.protocol-preview"] [data-ct-slot="settings.card"] {
+  border: 1px solid var(--rt-border) !important;
+  border-radius: var(--rt-radius) !important;
+  background: var(--rt-surface) !important;
+  box-shadow: 0 14px 32px rgba(30, 50, 110, 0.08) !important;
+}
+
+:root[data-ct-theme="studio.example.protocol-preview"] [data-ct-slot="home.card.label"],
+:root[data-ct-theme="studio.example.protocol-preview"] [data-ct-slot="home.prompt.title"] {
+  color: var(--rt-text) !important;
+}
+
+:root[data-ct-theme="studio.example.protocol-preview"] [data-ct-slot="composer"] {
+  border-color: var(--rt-border) !important;
+  background: var(--rt-surface) !important;
+}
+
+:root[data-ct-theme="studio.example.protocol-preview"] [data-ct-slot="composer.submit"],
+:root[data-ct-theme="studio.example.protocol-preview"] [data-ct-slot="settings.switch.track.checked"] {
+  background: var(--rt-accent) !important;
+}
+
+:root[data-ct-theme="studio.example.protocol-preview"] [data-ct-slot="home.hero"],
+:root[data-ct-theme="studio.example.protocol-preview"] [data-ct-slot="conversation.banner"] {
+  border: 1px solid var(--rt-border) !important;
+  border-radius: calc(var(--rt-radius) + 4px) !important;
+  overflow: hidden !important;
+}
