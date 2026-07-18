@@ -14,6 +14,7 @@ jobs:
     name: ${{ matrix.name }}
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         include:
           - name: macOS Apple Silicon
@@ -71,7 +72,7 @@ jobs:
 
             - macOS: Apple Silicon and Intel
             - Windows: x64 bilingual installer
-          releaseDraft: false
+          releaseDraft: true
           prerelease: false
           generateReleaseNotes: true
           updaterJsonPreferNsis: true
@@ -80,3 +81,25 @@ jobs:
         if: always()
         shell: bash
         run: rm -f src-tauri/config/api.toml src-tauri/config/security.toml
+
+  publish:
+    name: Publish verified release
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify updater metadata
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          gh release download "$GITHUB_REF_NAME" --repo "${{ github.repository }}" --pattern latest.json --dir release
+          jq -e '
+            .version == $version and
+            (.platforms["darwin-aarch64"] | .url != "" and .signature != "") and
+            (.platforms["darwin-x86_64"] | .url != "" and .signature != "") and
+            (.platforms["windows-x86_64"] | .url != "" and .signature != "")
+          ' --arg version "$version" release/latest.json
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "$GITHUB_REF_NAME" --repo "${{ github.repository }}" --draft=false --latest

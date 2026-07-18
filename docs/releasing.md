@@ -42,7 +42,7 @@ The matrix builds:
 - macOS Intel on `macos-15-intel` for `x86_64-apple-darwin` (`app` updater archive and DMG)
 - Windows x64 on `windows-latest` for `x86_64-pc-windows-msvc`
 
-The Windows NSIS installer offers Simplified Chinese and English. Tauri Action uploads installers, updater signatures, and `latest.json` to the same non-draft release.
+The Windows NSIS installer offers Simplified Chinese and English. Matrix builds update one draft release serially, then the publish job verifies all updater platform entries before marking it as the latest public release.
 
 ## Verify
 
