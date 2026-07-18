@@ -2115,6 +2115,26 @@ mod tests {
             repository.list().expect("list themes").len(),
             installed_before + 1
         );
+        let installed = repository.read_registry().expect("registry");
+        let digest = installed
+            .themes
+            .get("studio.example.test-theme")
+            .expect("installed theme")
+            .digest
+            .clone();
+        let cache_path = repository.store_path(&digest);
+        assert!(cache_path.is_file());
+
+        assert!(
+            repository
+                .uninstall("studio.example.test-theme")
+                .expect("uninstall signed theme")
+        );
+        assert_eq!(
+            repository.list().expect("list themes").len(),
+            installed_before
+        );
+        assert!(!cache_path.exists());
     }
 
     #[test]

@@ -17,7 +17,9 @@ const desktop = vi.hoisted(() => ({
   getAccountSync: vi.fn(),
   getThemePreviewStatus: vi.fn(),
   isDesktopRuntime: vi.fn(),
+  listThemes: vi.fn(),
   restoreOfficialTheme: vi.fn(),
+  uninstallTheme: vi.fn(),
   installation: {
     appName: "ChatGPT",
     path: "/Applications/ChatGPT.app",
@@ -64,7 +66,7 @@ vi.mock("./desktop-api", () => ({
     getRuntimeEnvironment: desktop.getRuntimeEnvironment,
     getThemePreviewStatus: desktop.getThemePreviewStatus,
     isDesktopRuntime: desktop.isDesktopRuntime,
-    listThemes: vi.fn().mockResolvedValue(desktop.themes),
+    listThemes: desktop.listThemes,
     loginAccount: vi.fn(),
     startOAuthLogin: desktop.startOAuthLogin,
     completeOAuthLogin: desktop.completeOAuthLogin,
@@ -77,6 +79,7 @@ vi.mock("./desktop-api", () => ({
     runSmokeTest: vi.fn(),
     syncThemeLocale: desktop.syncThemeLocale,
     syncTrayLocale: vi.fn(),
+    uninstallTheme: desktop.uninstallTheme,
   }));
 
 vi.mock("@tauri-apps/plugin-deep-link", () => ({
@@ -90,6 +93,7 @@ describe("ReTheme desktop shell", () => {
     desktop.isDesktopRuntime.mockReturnValue(false);
     desktop.checkForUpdate.mockReset().mockResolvedValue(null);
     desktop.getThemePreviewStatus.mockReset().mockResolvedValue(null);
+    desktop.listThemes.mockReset().mockResolvedValue(desktop.themes);
     desktop.getAccountStatus.mockReset().mockResolvedValue(desktop.account);
     desktop.getAccountSync.mockReset().mockResolvedValue({
       devices: [
@@ -123,6 +127,7 @@ describe("ReTheme desktop shell", () => {
       loopbackOnly: true,
     });
     desktop.restoreOfficialTheme.mockResolvedValue(true);
+    desktop.uninstallTheme.mockReset().mockResolvedValue(true);
     desktop.chooseAndPreviewLocalTheme.mockReset().mockResolvedValue(null);
   });
 
@@ -147,6 +152,18 @@ describe("ReTheme desktop shell", () => {
     fireEvent.click(restore);
     await waitFor(() => expect(desktop.restoreOfficialTheme).toHaveBeenCalledOnce());
     expect(await screen.findByRole("button", { name: "应用主题 Protocol Preview" })).toBeInTheDocument();
+  });
+
+  test("uninstalls an installed theme and refreshes the library", async () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderApp();
+    fireEvent.click(screen.getByRole("button", { name: "主题库" }));
+
+    fireEvent.click(await screen.findByRole("button", { name: "卸载主题 Protocol Preview" }));
+
+    await waitFor(() => expect(desktop.uninstallTheme).toHaveBeenCalledWith("studio.example.protocol-preview"));
+    await waitFor(() => expect(desktop.listThemes).toHaveBeenCalledTimes(2));
+    expect(confirm).toHaveBeenCalledWith("确定卸载“Protocol Preview”吗？本机主题文件将被删除。");
   });
 
   test("loads a local theme without a time limit", async () => {
