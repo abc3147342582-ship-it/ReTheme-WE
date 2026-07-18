@@ -5639,6 +5639,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires ChatGPT to be installed on the test Mac"]
     #[cfg(target_os = "macos")]
     fn detects_installed_codex() {
         let installation = detect().expect("Codex should be installed on the test Mac");
@@ -5647,6 +5648,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires ChatGPT to be installed on the test PC"]
     #[cfg(target_os = "windows")]
     fn detects_installed_chatgpt_package() {
         let installation = detect().expect("ChatGPT should be installed on the test PC");

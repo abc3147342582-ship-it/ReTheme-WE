@@ -51,3 +51,5 @@ The Windows NSIS installer offers Simplified Chinese and English. Matrix builds 
 3. `latest.json` points to the same release and contains all supported platforms.
 4. Install each native artifact and verify launch, language, tray, deep links, theme apply/restore, and update checks.
 5. Keep the tag immutable. Publish a new SemVer tag for every correction.
+
+The ignored Rust integration tests require ChatGPT to be installed and may launch isolated windows. Run them explicitly on maintained macOS and Windows test machines before a production rollout.
