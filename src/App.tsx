@@ -288,7 +288,7 @@ function ThemesPage(props: SharedPageProps & { localPreviewing: boolean; install
   );
 }
 
-function FavoritesPage({ account, accountSync, syncError, themes, onlineInstallingSlug, onInstallOnline }: { account: AccountStatus; accountSync: AccountSync | null; syncError: string; themes: ThemeSummary[]; onlineInstallingSlug: string; onInstallOnline: (slug: string) => void }) {
+function FavoritesPage({ account, accountSync, syncError, installError, themes, onlineInstallingSlug, onInstallOnline }: { account: AccountStatus; accountSync: AccountSync | null; syncError: string; installError: string; themes: ThemeSummary[]; onlineInstallingSlug: string; onInstallOnline: (slug: string) => void }) {
   const { locale, t } = useI18n();
   const [lockedMessage, setLockedMessage] = useState("");
   const favoriteThemes = accountSync?.themes.favorites.map((theme) => localizeAccountTheme(theme, locale)) ?? [];
@@ -297,6 +297,7 @@ function FavoritesPage({ account, accountSync, syncError, themes, onlineInstalli
     <section className="page favorites-page" aria-labelledby="cloud-favorites-title">
       <div className="page-heading"><h1 id="cloud-favorites-title">{t("nav.favorites")}</h1><p>{t("favorites.subtitle")}</p></div>
       <div className="cloud-library">
+        {installError && <div className="notice is-error">{installError}</div>}
         {account.pro ? syncError ? <div className="notice is-error">{syncError}</div> : accountSync ? (
             favoriteThemes.length ? (
               <div className="cloud-theme-list">
@@ -373,7 +374,7 @@ function DevicesPage({ account, accountSync, syncError }: { account: AccountStat
   );
 }
 
-function SettingsPage({ preferences, onToggle, installation, onDetect, onRestore, stopping, previewReport, account, appearance, onAppearanceChange, update, updateChecking, updateInstalling, updateError, onCheckUpdate, onInstallUpdate }: { preferences: DesktopPreferences; onToggle: (key: keyof DesktopPreferences) => void; installation: CodexInstallation | null; onDetect: () => void; onRestore: () => void; stopping: boolean; previewReport: ThemePreviewReport | null; account: AccountStatus; appearance: Appearance; onAppearanceChange: (value: Appearance) => void; update: DesktopUpdate | null; updateChecking: boolean; updateInstalling: boolean; updateError: string; onCheckUpdate: () => void; onInstallUpdate: () => void }) {
+function SettingsPage({ preferences, onToggle, installation, onDetect, onRestore, stopping, previewReport, runtimeEnvironment, account, appearance, onAppearanceChange, update, updateChecking, updateInstalling, updateError, onCheckUpdate, onInstallUpdate }: { preferences: DesktopPreferences; onToggle: (key: keyof DesktopPreferences) => void; installation: CodexInstallation | null; onDetect: () => void; onRestore: () => void; stopping: boolean; previewReport: ThemePreviewReport | null; runtimeEnvironment: RuntimeEnvironment | null; account: AccountStatus; appearance: Appearance; onAppearanceChange: (value: Appearance) => void; update: DesktopUpdate | null; updateChecking: boolean; updateInstalling: boolean; updateError: string; onCheckUpdate: () => void; onInstallUpdate: () => void }) {
   const { preference, setPreference, t } = useI18n();
   const heartbeat = heartbeatCopy(account, t);
   const appearanceOptions: Array<{ value: Appearance; label: string }> = [{ value: "system", label: t("common.system") }, { value: "light", label: t("common.light") }, { value: "dark", label: t("common.dark") }];
@@ -403,7 +404,7 @@ function SettingsPage({ preferences, onToggle, installation, onDetect, onRestore
         <div className="settings-group">
           <h2>{t("settings.update")}</h2>
           <div className="setting-row"><div><strong>{t("settings.autoUpdate")}</strong><p>{t("settings.autoUpdateDetail")}</p></div><Switch checked={preferences.autoUpdate} label={t("settings.autoUpdate")} onChange={() => onToggle("autoUpdate")} /></div>
-          <div className="setting-row"><div><strong>{t("settings.currentVersion")}</strong><p>{update ? t("settings.available", { version: update.version }) : t("settings.stableChannel")}</p>{updateError && <p className="error-line">{updateError}</p>}</div><button className={`button ${update ? "secondary" : "ghost"}`} disabled={updateChecking || updateInstalling} onClick={update ? onInstallUpdate : onCheckUpdate}>{updateInstalling ? t("settings.installing") : updateChecking ? t("settings.checking") : update ? t("settings.installUpdate") : t("settings.checkNow")}</button></div>
+          <div className="setting-row"><div><strong>{t("settings.currentVersion")}</strong><p>{update ? t("settings.available", { version: update.version }) : t("settings.stableChannel", { version: runtimeEnvironment?.appVersion ?? "—" })}</p>{update?.body && <p className="update-notes">{update.body}</p>}{updateError && <p className="error-line">{updateError}</p>}</div><button className={`button ${update ? "secondary" : "ghost"}`} disabled={updateChecking || updateInstalling} onClick={update ? onInstallUpdate : onCheckUpdate}>{updateInstalling ? t("settings.installing") : updateChecking ? t("settings.checking") : update ? t("settings.installUpdate") : t("settings.checkNow")}</button></div>
         </div>
         <div className="settings-group">
           <h2>{t("settings.themeService")}</h2>
@@ -452,6 +453,11 @@ function App() {
   const [updateChecking, setUpdateChecking] = useState(false);
   const [updateInstalling, setUpdateInstalling] = useState(false);
   const [updateError, setUpdateError] = useState("");
+
+  function localizedError(error: unknown): string {
+    const message = String(error);
+    return message.includes("RETHEME_AUTH_REQUIRED") ? t("themes.signInToInstall") : message;
+  }
 
   useEffect(() => {
     void syncTrayLocale(locale);
@@ -521,7 +527,7 @@ function App() {
       await loadThemeLibrary();
       if (account.authenticated) setAccountSync(await getAccountSync());
     } catch (error) {
-      setInstallError(String(error));
+      setInstallError(localizedError(error));
     } finally {
       setOnlineInstallingSlug("");
     }
@@ -685,7 +691,7 @@ function App() {
           setAccount(await getAccountStatus());
           await loadThemeLibrary();
         } catch (error) {
-          setInstallError(String(error));
+          setInstallError(localizedError(error));
         }
       }
     };
@@ -755,17 +761,17 @@ function App() {
         </nav>
         <div className="sidebar-foot">
           <div className={`codex-chip ${installation ? "is-ok" : ""}`}><i />{installation ? t("sidebar.connected") : detecting ? t("sidebar.detecting") : t("sidebar.disconnected")}</div>
-          <button className={`account-button ${accountOpen ? "is-open" : ""}`} onClick={() => setAccountOpen(true)} aria-expanded={accountOpen}><span className="avatar">{account.email?.slice(0, 2).toUpperCase() || "RT"}</span><span><strong>{account.email || t("account.loginReTheme")}</strong><small><i className={account.heartbeatState === "online" ? "is-live" : ""} /> {heartbeatCopy(account, t).title}</small></span>{account.pro && <em className="pro-tag">PRO</em>}</button>
+          <button className={`account-button ${accountOpen ? "is-open" : ""}`} onClick={() => setAccountOpen(true)} aria-expanded={accountOpen}><span className="avatar">{account.email?.slice(0, 2).toUpperCase() || "RT"}</span><span><strong>{account.email || t("account.loginReTheme")}</strong>{account.authenticated && <small><i className={account.heartbeatState === "online" ? "is-live" : ""} /> {heartbeatCopy(account, t).title}</small>}</span>{account.pro && <em className="pro-tag">PRO</em>}</button>
         </div>
       </aside>
 
       <div className="app-content">
         {page === "overview" && <OverviewPage {...sharedProps} runtimeEnvironment={runtimeEnvironment} smokeReport={smokeReport} smokeError={smokeError} testing={testing} onSmokeTest={() => void smokeTest()} />}
         {page === "themes" && <ThemesPage {...sharedProps} localPreviewing={localPreviewing} installReport={installReport} installError={installError} />}
-        {page === "favorites" && <FavoritesPage account={account} accountSync={accountSync} syncError={syncError} themes={localizedThemes} onlineInstallingSlug={onlineInstallingSlug} onInstallOnline={(slug) => void installOnlineTheme(slug)} />}
+        {page === "favorites" && <FavoritesPage account={account} accountSync={accountSync} syncError={syncError} installError={installError} themes={localizedThemes} onlineInstallingSlug={onlineInstallingSlug} onInstallOnline={(slug) => void installOnlineTheme(slug)} />}
         {page === "account" && <AccountPage account={account} onManage={() => setAccountOpen(true)} />}
         {page === "devices" && <DevicesPage account={account} accountSync={accountSync} syncError={syncError} />}
-        {page === "settings" && <SettingsPage preferences={preferences} onToggle={(key) => setPreferences((current) => ({ ...current, [key]: !current[key] }))} installation={installation} onDetect={() => void detect()} onRestore={() => void stopTheme()} stopping={stopping} previewReport={previewReport} account={account} appearance={appearance} onAppearanceChange={setAppearance} update={update} updateChecking={updateChecking} updateInstalling={updateInstalling} updateError={updateError} onCheckUpdate={() => void checkUpdate()} onInstallUpdate={() => void installUpdate()} />}
+        {page === "settings" && <SettingsPage preferences={preferences} onToggle={(key) => setPreferences((current) => ({ ...current, [key]: !current[key] }))} installation={installation} onDetect={() => void detect()} onRestore={() => void stopTheme()} stopping={stopping} previewReport={previewReport} runtimeEnvironment={runtimeEnvironment} account={account} appearance={appearance} onAppearanceChange={setAppearance} update={update} updateChecking={updateChecking} updateInstalling={updateInstalling} updateError={updateError} onCheckUpdate={() => void checkUpdate()} onInstallUpdate={() => void installUpdate()} />}
       </div>
 
       <AccountDialog open={accountOpen} status={account} notice={oauthMessage} onClose={() => setAccountOpen(false)} onChange={setAccount} />

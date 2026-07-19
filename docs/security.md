@@ -12,6 +12,7 @@ ReTheme reduces theme risk through a narrow declarative protocol. It does not cl
 - Local development directories intentionally bypass package signing and encryption, but are never installed as community packages.
 - Signed compatibility data is selected by ChatGPT version and rejects tampering, expiry mismatches, and rollback.
 - Tauri updater artifacts are signed by a separate update key and verified before installation.
+- macOS applications and DMGs are signed with the ReTheme Apple Developer ID identity, use the hardened runtime, and are notarized and stapled before publication.
 
 ## Theme restrictions
 
@@ -22,5 +23,7 @@ Themes cannot include JavaScript, external URLs, remote fonts, `@import`, active
 This public desktop repository commits templates and public verification keys only. GitHub Actions receives production build values from repository secrets and deletes generated TOML files after each build. The platform's private signing keys remain in the private server/source repository.
 
 API identifiers, client signing material, and package decryption values compiled into a desktop application should be treated as recoverable defense-in-depth values. Server authorization, signed responses, short-lived download URLs, account state, replay protection, and entitlement checks remain authoritative.
+
+Apple Developer ID signing and Tauri updater signing use separate keys and protect different boundaries. Passing updater signature verification does not imply that Gatekeeper will accept an unsigned or unnotarized macOS application.
 
 Please report security issues privately through the contact channel on [retheme.app](https://retheme.app) rather than publishing exploit details in a public issue.

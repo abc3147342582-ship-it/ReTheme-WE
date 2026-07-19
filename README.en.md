@@ -88,5 +88,6 @@ Configuration templates contain no production secrets. Maintainers should read t
 - [中文主题开发规范](docs/theme-development.md)
 - [Security Model](docs/security.md)
 - [Release Guide](docs/releasing.md)
+- [License](LICENSE)
 - [ReTheme Website](https://retheme.app)
 - [Issue Tracker](https://github.com/duxweb/ReTheme/issues)

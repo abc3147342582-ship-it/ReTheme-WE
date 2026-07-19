@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import App from "./App";
 import { DEMO_INSTALLATION, DEMO_THEMES } from "./demo-data";
@@ -18,6 +18,7 @@ const desktop = vi.hoisted(() => ({
   getThemePreviewStatus: vi.fn(),
   isDesktopRuntime: vi.fn(),
   listThemes: vi.fn(),
+  downloadOnlineTheme: vi.fn(),
   restoreOfficialTheme: vi.fn(),
   uninstallTheme: vi.fn(),
   installation: {
@@ -60,7 +61,7 @@ vi.mock("./desktop-api", () => ({
     checkForUpdate: desktop.checkForUpdate,
     chooseAndPreviewLocalTheme: desktop.chooseAndPreviewLocalTheme,
     detectCodex: vi.fn().mockResolvedValue(desktop.installation),
-    downloadOnlineTheme: vi.fn(),
+    downloadOnlineTheme: desktop.downloadOnlineTheme,
     getAccountStatus: desktop.getAccountStatus,
     getAccountSync: desktop.getAccountSync,
     getRuntimeEnvironment: desktop.getRuntimeEnvironment,
@@ -94,6 +95,7 @@ describe("ReTheme desktop shell", () => {
     desktop.checkForUpdate.mockReset().mockResolvedValue(null);
     desktop.getThemePreviewStatus.mockReset().mockResolvedValue(null);
     desktop.listThemes.mockReset().mockResolvedValue(desktop.themes);
+    desktop.downloadOnlineTheme.mockReset();
     desktop.getAccountStatus.mockReset().mockResolvedValue(desktop.account);
     desktop.getAccountSync.mockReset().mockResolvedValue({
       devices: [
@@ -260,7 +262,10 @@ describe("ReTheme desktop shell", () => {
   test("offers GitHub and Linux DO login for signed-out accounts", async () => {
     desktop.getAccountStatus.mockResolvedValue({ ...desktop.account, authenticated: false, email: undefined, pro: false, heartbeatState: "offline" });
     renderApp();
-    fireEvent.click(await screen.findByRole("button", { name: /登录 ReTheme/ }));
+    const accountButton = (await screen.findByText("登录")).closest("button");
+    expect(accountButton).not.toBeNull();
+    expect(within(accountButton!).queryByText("未登录")).not.toBeInTheDocument();
+    fireEvent.click(accountButton!);
 
     fireEvent.click(screen.getByRole("button", { name: "使用 GitHub 登录" }));
     await waitFor(() => expect(desktop.startOAuthLogin).toHaveBeenCalledWith("github"));
@@ -309,6 +314,25 @@ describe("ReTheme desktop shell", () => {
     expect((await screen.findAllByText("Midnight Orbit")).length).toBeGreaterThanOrEqual(2);
     expect(screen.getByText("Protocol Preview")).toBeInTheDocument();
     expect(screen.queryByText("午夜轨道")).not.toBeInTheDocument();
+  });
+
+  test("localizes the required sign-in message for online installation", async () => {
+    desktop.downloadOnlineTheme.mockRejectedValue(new Error("RETHEME_AUTH_REQUIRED"));
+    renderApp();
+    fireEvent.click(screen.getByRole("button", { name: "云端收藏" }));
+    fireEvent.click(await screen.findByRole("button", { name: "安装" }));
+
+    expect(await screen.findByText("请先登录 ReTheme 后安装在线主题")).toBeInTheDocument();
+  });
+
+  test("localizes the required sign-in message in English", async () => {
+    window.localStorage.setItem("retheme.locale", "en");
+    desktop.downloadOnlineTheme.mockRejectedValue(new Error("RETHEME_AUTH_REQUIRED"));
+    renderApp();
+    fireEvent.click(screen.getByRole("button", { name: "Cloud Favorites" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Install" }));
+
+    expect(await screen.findByText("Sign in to ReTheme before installing an online theme")).toBeInTheDocument();
   });
 
   test("shows a free account without purchase prompts", async () => {
@@ -389,6 +413,7 @@ describe("ReTheme desktop shell", () => {
     fireEvent.click(screen.getByRole("button", { name: "设置" }));
     const installUpdate = await screen.findByRole("button", { name: "安装并重启" });
     expect(screen.getByText("发现 ReTheme 0.1.1")).toBeInTheDocument();
+    expect(screen.getByText("Test update")).toBeInTheDocument();
     fireEvent.click(installUpdate);
 
     await waitFor(() => expect(desktop.restoreOfficialTheme).toHaveBeenCalledOnce());

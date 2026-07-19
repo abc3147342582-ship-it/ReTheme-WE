@@ -3,6 +3,7 @@ name = "retheme"
 version = "0.1.0"
 description = "A safe local theme manager for Codex"
 authors = ["ReTheme"]
+license = "BSD-3-Clause"
 edition = "2024"
 
 [lib]
@@ -20,7 +21,6 @@ ed25519-dalek = "2.2.0"
 hex = "0.4.3"
 hkdf = "0.12.4"
 hmac = "0.12.1"
-keyring = "=4.1.1"
 lightningcss = { version = "1.0.0-alpha.71", default-features = false }
 plist = "1.8.0"
 rand_core = { version = "0.6.4", features = ["getrandom"] }

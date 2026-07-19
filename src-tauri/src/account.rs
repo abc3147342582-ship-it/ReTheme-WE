@@ -5,16 +5,13 @@ use base64::{
 use crypto_secretbox::{KeyInit, Nonce, XSalsa20Poly1305, aead::Aead};
 use ed25519_dalek::{Signature, VerifyingKey};
 use hkdf::Hkdf;
-#[cfg(not(debug_assertions))]
-use keyring::{Entry, Error as KeyringError};
 use rand_core::OsRng;
 use reqwest::{Client, Method, StatusCode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-#[cfg(debug_assertions)]
 use std::io::Write;
-#[cfg(all(debug_assertions, unix))]
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -32,10 +29,9 @@ use crate::{
     theme::{ThemeInstallReport, ThemeRepository},
 };
 
-#[cfg(not(debug_assertions))]
-const KEYRING_SERVICE: &str = "app.retheme.desktop";
 const TOKEN_ENTRY: &str = "access-token";
 const DEVICE_SECRET_ENTRY: &str = "device-x25519-private";
+const AUTH_REQUIRED_ERROR: &str = "RETHEME_AUTH_REQUIRED";
 const MAX_ONLINE_THEME_SIZE: u64 = 30 * 1024 * 1024;
 const PLATFORM_PACKAGE_MAGIC: &[u8; 4] = b"RTP1";
 
@@ -581,11 +577,11 @@ impl AccountRuntime {
         slug: String,
         themes: &ThemeRepository,
     ) -> Result<ThemeInstallReport, AccountError> {
-        let token = self.read_secret(TOKEN_ENTRY)?;
+        let token = self.require_theme_download_token()?;
         let download: OnlineDownload = self
             .post(
                 &format!("/themes/{slug}/download"),
-                token.as_deref(),
+                Some(&token),
                 json!({
                     "device_id": self.device_id
                 }),
@@ -912,62 +908,38 @@ impl AccountRuntime {
             .ok_or_else(|| AccountError::message("请先登录 ReTheme"))
     }
 
+    fn require_theme_download_token(&self) -> Result<String, AccountError> {
+        self.read_secret(TOKEN_ENTRY)?
+            .ok_or_else(|| AccountError::message(AUTH_REQUIRED_ERROR))
+    }
+
     fn read_secret(&self, name: &str) -> Result<Option<String>, AccountError> {
-        #[cfg(debug_assertions)]
-        {
-            match fs::read_to_string(self.development_secret_path(name)) {
-                Ok(value) => Ok(Some(value)),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(error) => Err(AccountError::message(format!("无法读取开发凭据：{error}"))),
-            }
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            let entry = Entry::new(KEYRING_SERVICE, name).map_err(keyring_error)?;
-            match entry.get_password() {
-                Ok(value) => Ok(Some(value)),
-                Err(KeyringError::NoEntry) => Ok(None),
-                Err(error) => Err(keyring_error(error)),
-            }
+        match fs::read_to_string(self.credential_path(name)) {
+            Ok(value) => Ok(Some(value)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(AccountError::message(format!("无法读取账号凭据：{error}"))),
         }
     }
 
     fn write_secret(&self, name: &str, value: &str) -> Result<(), AccountError> {
-        #[cfg(debug_assertions)]
-        {
-            let path = self.development_secret_path(name);
-            let mut options = fs::OpenOptions::new();
-            options.create(true).write(true).truncate(true);
-            #[cfg(unix)]
-            options.mode(0o600);
-            let mut file = options
-                .open(&path)
-                .map_err(|error| AccountError::message(format!("无法保存开发凭据：{error}")))?;
-            file.write_all(value.as_bytes())
-                .map_err(|error| AccountError::message(format!("无法保存开发凭据：{error}")))?;
-            file.sync_all()
-                .map_err(|error| AccountError::message(format!("无法同步开发凭据：{error}")))?;
-            secure_file(&path)?;
-            Ok(())
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            Entry::new(KEYRING_SERVICE, name)
-                .map_err(keyring_error)?
-                .set_password(value)
-                .map_err(keyring_error)
-        }
+        let path = self.credential_path(name);
+        let mut options = fs::OpenOptions::new();
+        options.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options
+            .open(&path)
+            .map_err(|error| AccountError::message(format!("无法保存账号凭据：{error}")))?;
+        file.write_all(value.as_bytes())
+            .map_err(|error| AccountError::message(format!("无法保存账号凭据：{error}")))?;
+        file.sync_all()
+            .map_err(|error| AccountError::message(format!("无法同步账号凭据：{error}")))?;
+        secure_file(&path)?;
+        Ok(())
     }
 
     fn delete_secret(&self, name: &str) {
-        #[cfg(debug_assertions)]
-        {
-            let _ = fs::remove_file(self.development_secret_path(name));
-        }
-        #[cfg(not(debug_assertions))]
-        if let Ok(entry) = Entry::new(KEYRING_SERVICE, name) {
-            let _ = entry.delete_credential();
-        }
+        let _ = fs::remove_file(self.credential_path(name));
     }
 
     fn clear_credentials(&self) {
@@ -995,9 +967,8 @@ impl AccountRuntime {
         self.data_dir.join("license-lease.json")
     }
 
-    #[cfg(debug_assertions)]
-    fn development_secret_path(&self, name: &str) -> PathBuf {
-        self.data_dir.join(format!(".development-{name}"))
+    fn credential_path(&self, name: &str) -> PathBuf {
+        self.data_dir.join(format!(".credential-{name}"))
     }
 }
 
@@ -1010,11 +981,10 @@ fn secure_directory(path: &Path) -> Result<(), AccountError> {
     Ok(())
 }
 
-#[cfg(debug_assertions)]
 fn secure_file(path: &Path) -> Result<(), AccountError> {
     #[cfg(unix)]
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .map_err(|error| AccountError::message(format!("无法保护开发凭据：{error}")))?;
+        .map_err(|error| AccountError::message(format!("无法保护账号凭据：{error}")))?;
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
@@ -1205,11 +1175,6 @@ fn decode_array<const LENGTH: usize>(
         .map_err(|_| AccountError::message(format!("{label}长度无效")))
 }
 
-#[cfg(not(debug_assertions))]
-fn keyring_error(error: KeyringError) -> AccountError {
-    AccountError::message(format!("无法访问系统钥匙串：{error}"))
-}
-
 pub(crate) fn unix_time() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1242,30 +1207,29 @@ mod tests {
         }
     }
 
-    #[cfg(debug_assertions)]
     #[test]
-    fn stores_development_credentials_without_system_keyring() {
+    fn stores_credentials_without_system_keyring() {
         let directory = tempfile::tempdir().expect("account directory");
         let runtime = AccountRuntime::new(directory.path().join("account")).expect("account");
 
         runtime
-            .write_secret(TOKEN_ENTRY, "development-token")
+            .write_secret(TOKEN_ENTRY, "account-token")
             .expect("write secret");
         assert_eq!(
             runtime.read_secret(TOKEN_ENTRY).expect("read secret"),
-            Some("development-token".into())
+            Some("account-token".into())
         );
         runtime.delete_secret(TOKEN_ENTRY);
         assert_eq!(runtime.read_secret(TOKEN_ENTRY).expect("deleted"), None);
     }
 
-    #[cfg(all(debug_assertions, unix))]
+    #[cfg(unix)]
     #[test]
-    fn restricts_development_credential_permissions() {
+    fn restricts_credential_permissions() {
         let directory = tempfile::tempdir().expect("account directory");
         let runtime = AccountRuntime::new(directory.path().join("account")).expect("account");
         runtime
-            .write_secret(DEVICE_SECRET_ENTRY, "development-secret")
+            .write_secret(DEVICE_SECRET_ENTRY, "device-secret")
             .expect("write secret");
 
         let directory_mode = fs::metadata(&runtime.data_dir)
@@ -1273,13 +1237,26 @@ mod tests {
             .permissions()
             .mode()
             & 0o777;
-        let file_mode = fs::metadata(runtime.development_secret_path(DEVICE_SECRET_ENTRY))
+        let file_mode = fs::metadata(runtime.credential_path(DEVICE_SECRET_ENTRY))
             .expect("secret metadata")
             .permissions()
             .mode()
             & 0o777;
         assert_eq!(directory_mode, 0o700);
         assert_eq!(file_mode, 0o600);
+    }
+
+    #[test]
+    fn requires_login_before_downloading_an_online_theme() {
+        let directory = tempfile::tempdir().expect("account directory");
+        let runtime = AccountRuntime::new(directory.path().join("account")).expect("account");
+        assert_eq!(
+            runtime
+                .require_theme_download_token()
+                .expect_err("missing token")
+                .to_string(),
+            AUTH_REQUIRED_ERROR
+        );
     }
 
     #[cfg(debug_assertions)]

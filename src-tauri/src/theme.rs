@@ -949,8 +949,14 @@ fn validate_manifest(manifest: &ThemeManifest) -> Result<(), ThemeError> {
             manifest.schema_version
         )));
     }
-    if !is_valid_id(&manifest.id) || !is_valid_id(&manifest.author.id) {
-        return Err(ThemeError("主题或作者 ID 格式无效".into()));
+    if !is_valid_theme_id(&manifest.id) {
+        return Err(ThemeError(format!("主题 ID 格式无效：{}", manifest.id)));
+    }
+    if !is_valid_author_id(&manifest.author.id) {
+        return Err(ThemeError(format!(
+            "作者 ID 格式无效：{}",
+            manifest.author.id
+        )));
     }
     Version::parse(&manifest.version)
         .map_err(|error| ThemeError(format!("主题版本无效：{error}")))?;
@@ -1804,10 +1810,13 @@ fn extension(path: &str) -> Option<&str> {
     path.rsplit_once('.').map(|(_, extension)| extension)
 }
 
-fn is_valid_id(value: &str) -> bool {
+fn is_valid_theme_id(value: &str) -> bool {
+    value.contains('.') && is_valid_author_id(value)
+}
+
+fn is_valid_author_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
-        && value.contains('.')
         && value.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-')
         })
@@ -2231,6 +2240,16 @@ mod tests {
         assert_eq!(package.id(), "studio.example.protocol-preview");
         assert_eq!(package.version(), "1.0.0");
         assert_eq!(package.runtime_assets().len(), 1);
+    }
+
+    #[test]
+    fn accepts_platform_and_account_author_ids_without_weakening_theme_ids() {
+        assert!(is_valid_author_id("retheme"));
+        assert!(is_valid_author_id("123456789"));
+        assert!(is_valid_author_id("studio.example"));
+        assert!(is_valid_theme_id("studio.example.community-theme"));
+        assert!(!is_valid_theme_id("community-theme"));
+        assert!(!is_valid_author_id("Invalid Author"));
     }
 
     #[test]

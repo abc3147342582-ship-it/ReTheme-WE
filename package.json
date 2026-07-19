@@ -2,12 +2,15 @@
   "name": "retheme",
   "private": true,
   "version": "0.1.0",
+  "license": "BSD-3-Clause",
   "packageManager": "pnpm@10.31.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
     "test": "vitest run",
+    "test:release": "node --test scripts/*.node-test.mjs",
+    "version:check": "node scripts/sync-version.mjs --check",
     "preview": "vite preview",
     "tauri": "tauri"
   },

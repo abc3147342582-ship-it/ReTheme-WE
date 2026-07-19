@@ -317,6 +317,8 @@ button:focus-visible {
 .account-button small i { flex: 0 0 auto; width: 6px; height: 6px; border-radius: 50%; background: var(--quiet); }
 .account-button small i.is-live { background: var(--ok); }
 
+.update-notes { max-width: 560px; max-height: 120px; overflow: auto; white-space: pre-wrap; }
+
 /* ============ 内容区 ============ */
 
 .app-content { grid-column: 2; min-height: 0; min-width: 0; overflow: hidden; }

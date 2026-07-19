@@ -146,6 +146,7 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
 
 #[tauri::command]
 fn sync_tray_locale(locale: String, app: tauri::AppHandle) -> Result<(), String> {
+    api::set_language(&locale);
     let labels = tray_labels(&locale);
     let open = MenuItemBuilder::with_id(TRAY_OPEN_ID, labels.open)
         .build(&app)
