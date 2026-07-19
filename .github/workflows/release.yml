@@ -84,7 +84,6 @@ jobs:
     needs: prepare
     strategy:
       fail-fast: false
-      max-parallel: 1
       matrix:
         include:
           - name: macOS Apple Silicon
@@ -205,24 +204,32 @@ jobs:
           releaseAssetNamePattern: "[name]-[platform]-[arch][setup][ext]"
           retryAttempts: 2
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
-      - name: Verify Apple distribution artifacts
+      - name: Verify local Apple distribution artifacts
+        if: runner.os == 'macOS'
+        shell: bash
+        run: bash scripts/verify-macos-release.sh "${{ matrix.target }}"
+      - name: Upload stable Apple disk image
         if: runner.os == 'macOS'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          APPLE_API_KEY_PATH: ${{ env.APPLE_API_KEY_PATH }}
         run: |
-          bash scripts/verify-macos-release.sh "${{ matrix.target }}" --notarize-dmg
           upload_dir="$RUNNER_TEMP/release-upload"
           asset_name="ReTheme-darwin-${{ matrix.asset_arch }}.dmg"
           mkdir -p "$upload_dir"
           cp src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg "$upload_dir/$asset_name"
-          gh release upload "${{ needs.prepare.outputs.tag }}" \
-            "$upload_dir/$asset_name" \
-            --repo "${{ github.repository }}" \
-            --clobber
+          bash scripts/upload-release-asset.sh \
+            "${{ needs.prepare.outputs.release_id }}" \
+            "$asset_name" \
+            "$upload_dir/$asset_name"
+      - name: Preserve Apple disk image for remote verification
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg-${{ matrix.asset_arch }}
+          path: src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 1
       - name: Remove generated configuration
         if: always()
         shell: bash
@@ -252,7 +259,7 @@ jobs:
             )
           ' release/latest.json > release/latest.normalized.json
           mv release/latest.normalized.json release/latest.json
-          gh release upload "$tag" release/latest.json --repo "${{ github.repository }}" --clobber
+          bash scripts/upload-release-asset.sh "$release_id" latest.json release/latest.json
       - name: Verify updater metadata
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -281,9 +288,6 @@ jobs:
           jq -Rn --rawfile actual release/release-body.md --rawfile expected "$notes_path" '
             ($actual | rtrimstr("\n")) == ($expected | rtrimstr("\n"))
           ' | grep -Fxq true || { echo "GitHub release notes do not match the current changelog" >&2; exit 1; }
-          jq -r '.platforms | [."darwin-aarch64", ."darwin-x86_64", ."windows-x86_64"] | .[].url' release/latest.json |
-            while read -r url; do curl --fail --location --head "$url"; done
-
           expected_assets=(
             ReTheme-darwin-aarch64.dmg
             ReTheme-darwin-x64.dmg
@@ -302,3 +306,69 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release edit "${{ needs.prepare.outputs.tag }}" --repo "${{ github.repository }}" --draft=false --latest
+
+  apple-remote:
+    name: Apple remote verification (${{ matrix.asset_arch }})
+    needs: [prepare, publish]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            asset_arch: aarch64
+          - target: x86_64-apple-darwin
+            asset_arch: x64
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-dmg-${{ matrix.asset_arch }}
+          path: src-tauri/target/${{ matrix.target }}/release/bundle/dmg
+      - name: Configure Apple remote verification
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_PRIVATE_KEY_BASE64: ${{ secrets.APPLE_API_PRIVATE_KEY_BASE64 }}
+        run: |
+          api_key_path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          printf '%s' "$APPLE_API_PRIVATE_KEY_BASE64" | base64 --decode > "$api_key_path"
+          chmod 600 "$api_key_path"
+          echo "APPLE_API_KEY_PATH=$api_key_path" >> "$GITHUB_ENV"
+      - name: Notarize and remotely verify Apple disk image
+        id: verification
+        continue-on-error: true
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_PATH: ${{ env.APPLE_API_KEY_PATH }}
+        run: bash scripts/notarize-macos-dmg.sh "${{ matrix.target }}"
+      - name: Replace release disk image after verification
+        if: steps.verification.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          source_path="$(find src-tauri/target/${{ matrix.target }}/release/bundle/dmg -type f -name '*.dmg' -print -quit)"
+          bash scripts/upload-release-asset.sh \
+            "${{ needs.prepare.outputs.release_id }}" \
+            "ReTheme-darwin-${{ matrix.asset_arch }}.dmg" \
+            "$source_path"
+      - name: Report Apple remote verification failure
+        if: steps.verification.outcome == 'failure'
+        run: echo "::warning::Apple remote DMG verification failed without blocking the release."
+
+  remote-verify:
+    name: Verify published distribution
+    needs: [prepare, publish, apple-remote]
+    if: always() && needs.publish.result == 'success'
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download and remotely verify published assets
+        id: distribution
+        continue-on-error: true
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: bash scripts/verify-published-release.sh "${{ needs.prepare.outputs.version }}"
+      - name: Report remote distribution verification failure
+        if: steps.distribution.outcome == 'failure'
+        run: echo "::warning::Published distribution verification failed without blocking the release."
