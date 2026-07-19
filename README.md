@@ -110,4 +110,5 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 - [发版流程](docs/releasing.md)
 - [开源协议](LICENSE)
 - [ReTheme 官网](https://retheme.app)
+- [LINUX DO 社区](https://linux.do/)
 - [问题反馈](https://github.com/duxweb/ReTheme/issues)
