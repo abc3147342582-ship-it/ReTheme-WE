@@ -22,6 +22,16 @@ download latest.json
 
 jq -e --arg version "$version" '.version == $version' "$work_dir/latest.json" >/dev/null
 
+release_root="https://github.com/${repository}/releases/download/v${version}/"
+jq -e --arg release_root "$release_root" '
+  [.platforms[].url | startswith($release_root)] | all
+' "$work_dir/latest.json" >/dev/null
+
+while read -r updater_url; do
+  curl --fail --head --location --retry 6 --retry-delay 5 --retry-all-errors \
+    "$updater_url" --output /dev/null
+done < <(jq -r '.platforms | to_entries | map(.value.url) | unique[]' "$work_dir/latest.json")
+
 for dmg_path in "$work_dir"/*.dmg; do
   codesign --verify --strict --verbose=2 "$dmg_path"
   signature_info="$(codesign -dvvv "$dmg_path" 2>&1)"
