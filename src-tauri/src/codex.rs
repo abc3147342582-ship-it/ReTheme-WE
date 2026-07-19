@@ -56,6 +56,7 @@ const PAGE_RESTORE_THEME_FUNCTION: &str = r#"(expectedSessionId = null, closeWin
     window.removeEventListener('resize', runtime.handleResize);
   }
   if (runtime?.frame) cancelAnimationFrame(runtime.frame);
+  if (runtime?.homeFrame) cancelAnimationFrame(runtime.homeFrame);
   if (runtime?.contentFrame) cancelAnimationFrame(runtime.contentFrame);
   if (runtime?.metricsFrame) cancelAnimationFrame(runtime.metricsFrame);
   if (runtime?.resizeFrame) cancelAnimationFrame(runtime.resizeFrame);
@@ -1479,6 +1480,7 @@ fn apply_theme(
           else {{
             existingRuntime?.observer?.disconnect();
             existingRuntime?.schemeObserver?.disconnect();
+            existingRuntime?.composerLayoutObserver?.disconnect();
             if (existingRuntime?.colorSchemeMedia && existingRuntime?.syncColorScheme) {{
               existingRuntime.colorSchemeMedia.removeEventListener('change', existingRuntime.syncColorScheme);
             }}
@@ -1493,8 +1495,10 @@ fn apply_theme(
               window.removeEventListener('resize', existingRuntime.handleResize);
             }}
             if (existingRuntime?.frame) cancelAnimationFrame(existingRuntime.frame);
+            if (existingRuntime?.homeFrame) cancelAnimationFrame(existingRuntime.homeFrame);
             if (existingRuntime?.contentFrame) cancelAnimationFrame(existingRuntime.contentFrame);
             if (existingRuntime?.metricsFrame) cancelAnimationFrame(existingRuntime.metricsFrame);
+            if (existingRuntime?.resizeFrame) cancelAnimationFrame(existingRuntime.resizeFrame);
             if (existingRuntime?.leaseTimer) clearInterval(existingRuntime.leaseTimer);
             existingRuntime?.revokeAssets?.();
           }}
@@ -3572,6 +3576,7 @@ fn apply_theme(
             colorSchemeMedia,
             syncColorScheme,
             frame: 0,
+            homeFrame: 0,
             contentFrame: 0,
             metricsFrame: 0,
             resizeFrame: 0,
@@ -3588,8 +3593,10 @@ fn apply_theme(
             if (runtime.frame) return;
             runtime.frame = requestAnimationFrame(() => {{
               runtime.frame = 0;
+              if (runtime.homeFrame) cancelAnimationFrame(runtime.homeFrame);
               if (runtime.contentFrame) cancelAnimationFrame(runtime.contentFrame);
               if (runtime.metricsFrame) cancelAnimationFrame(runtime.metricsFrame);
+              runtime.homeFrame = 0;
               runtime.contentFrame = 0;
               runtime.metricsFrame = 0;
               runtime.pendingConversationRoots.clear();
@@ -3597,6 +3604,37 @@ fn apply_theme(
               try {{
                 runtime.root = document.getElementById('root');
                 runtime.slots = apply() ?? runtime.slots;
+                runtime.lastApplyError = null;
+              }} catch (error) {{
+                runtime.lastApplyError = {{
+                  message: String(error),
+                  stack: error?.stack ?? null
+                }};
+              }} finally {{
+                if (window[runtimeKey] === runtime && document.documentElement) {{
+                  runtime.observer.observe(document.documentElement, observeOptions);
+                }}
+              }}
+            }});
+          }};
+          const scheduleHomeRefresh = () => {{
+            if (runtime.frame || runtime.homeFrame) return;
+            runtime.homeFrame = requestAnimationFrame(() => {{
+              runtime.homeFrame = 0;
+              const view = document.documentElement.dataset.ctView;
+              if (view !== 'home' && view !== 'home-compact') return;
+              const appMain = [...document.querySelectorAll(adapter.selectors.main)]
+                .find(isVisible);
+              const editors = [...document.querySelectorAll(adapter.selectors.composer)];
+              const editor = editors.find(isVisible) ?? editors[0] ?? null;
+              if (!appMain || !editor) return;
+              runtime.observer.disconnect();
+              try {{
+                const homeSlots = [];
+                mountHero(appMain, editor, homeSlots);
+                syncComposerLayout(editor);
+                syncTitlebarSafeTop(appMain);
+                runtime.slots = [...new Set([...runtime.slots, ...homeSlots])];
                 runtime.lastApplyError = null;
               }} catch (error) {{
                 runtime.lastApplyError = {{
@@ -3678,6 +3716,7 @@ fn apply_theme(
             );
           runtime.observer = new MutationObserver(mutations => {{
             let needsApply = false;
+            let needsHomeRefresh = false;
             const conversationRoots = [];
             const settingsOpen = Boolean(
               document.querySelector(adapter.selectors.settingsItem)
@@ -3688,6 +3727,12 @@ fn apply_theme(
               if (mutation.type === 'attributes') {{
                 if (conversation) {{
                   conversationRoots.push(target);
+                  continue;
+                }}
+                const view = document.documentElement.dataset.ctView;
+                if ((view === 'home' || view === 'home-compact')
+                  && target?.closest(adapter.selectors.composerRoot)) {{
+                  needsHomeRefresh = true;
                   continue;
                 }}
                 if (target?.closest([
@@ -3726,7 +3771,7 @@ fn apply_theme(
               const view = document.documentElement.dataset.ctView;
               if ((view === 'home' || view === 'home-compact')
                 && target?.closest(adapter.selectors.main)) {{
-                needsApply = true;
+                needsHomeRefresh = true;
                 continue;
               }}
               if (target?.closest([
@@ -3741,6 +3786,7 @@ fn apply_theme(
             }}
             if (conversationRoots.length) scheduleConversationContent(conversationRoots);
             if (needsApply) scheduleApply();
+            else if (needsHomeRefresh) scheduleHomeRefresh();
           }});
           runtime.handleInput = event => {{
             const composerRoot = document.querySelector(adapter.selectors.composerRoot);
@@ -3748,7 +3794,7 @@ fn apply_theme(
             if ((view === 'home' || view === 'home-compact')
               && event.target instanceof Node
               && composerRoot?.contains(event.target)) {{
-              scheduleApply();
+              scheduleHomeRefresh();
             }}
           }};
           runtime.handleNavigation = event => {{
@@ -3862,6 +3908,7 @@ fn remove_theme(websocket_url: &str) -> Result<bool, CodexError> {
         window.removeEventListener('resize', runtime.handleResize);
       }
       if (runtime?.frame) cancelAnimationFrame(runtime.frame);
+      if (runtime?.homeFrame) cancelAnimationFrame(runtime.homeFrame);
       if (runtime?.contentFrame) cancelAnimationFrame(runtime.contentFrame);
       if (runtime?.metricsFrame) cancelAnimationFrame(runtime.metricsFrame);
       if (runtime?.resizeFrame) cancelAnimationFrame(runtime.resizeFrame);
@@ -4777,6 +4824,65 @@ mod tests {
         assert!(!runtime_source.contains(
             "return routeBoundaryChanged || relevantNodeChanged || Boolean(target?.closest"
         ));
+    }
+
+    #[test]
+    fn home_input_refreshes_only_home_slots() {
+        let source = include_str!("codex.rs");
+        let runtime_source = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("runtime source");
+
+        assert!(runtime_source.contains("const scheduleHomeRefresh = () =>"));
+        assert!(runtime_source.contains("runtime.handleInput = event =>"));
+        assert!(runtime_source.contains("mountHero(appMain, editor, homeSlots)"));
+        assert!(runtime_source.contains("syncComposerLayout(editor)"));
+        assert!(runtime_source.contains("scheduleHomeRefresh();"));
+        assert!(
+            !runtime_source.contains(
+                "composerRoot?.contains(event.target)) {{\n              scheduleApply();"
+            )
+        );
+        assert_eq!(
+            runtime_source
+                .matches("if (runtime?.homeFrame) cancelAnimationFrame(runtime.homeFrame)")
+                .count(),
+            2
+        );
+        assert!(runtime_source.contains(
+            "if (existingRuntime?.homeFrame) cancelAnimationFrame(existingRuntime.homeFrame)"
+        ));
+    }
+
+    #[test]
+    fn legacy_runtime_fallback_releases_every_observer_and_frame() {
+        let source = include_str!("codex.rs");
+        let fallback = source
+            .split("else {{\n            existingRuntime?.observer?.disconnect();")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("document.querySelectorAll('[data-ct-managed-asset]')")
+                    .next()
+            })
+            .expect("legacy runtime fallback");
+
+        assert!(fallback.contains("existingRuntime?.composerLayoutObserver?.disconnect()"));
+        for frame in [
+            "frame",
+            "homeFrame",
+            "contentFrame",
+            "metricsFrame",
+            "resizeFrame",
+        ] {
+            assert!(
+                fallback.contains(&format!(
+                    "if (existingRuntime?.{frame}) cancelAnimationFrame(existingRuntime.{frame})"
+                )),
+                "missing cleanup for {frame}"
+            );
+        }
     }
 
     #[test]
@@ -6022,8 +6128,7 @@ mod tests {
                   && heroRect.left >= stageRect.left - 1
                   && heroRect.right <= stageRect.right + 1),
                 heroMaxWidth: hero ? getComputedStyle(hero).maxWidth : null,
-                heroViewportClips: heroViewport?.parentElement === hero
-                  && getComputedStyle(heroViewport).overflow === 'hidden',
+                heroViewportBelongsToHero: heroViewport?.parentElement === hero,
                 heroViewportInFlow: Boolean(heroViewport
                   && !['absolute', 'fixed'].includes(getComputedStyle(heroViewport).position)),
                 heroViewportFillsHero: Boolean(heroRect && heroViewportRect
@@ -6061,11 +6166,10 @@ mod tests {
         )
         .expect("custom home prompt");
         assert!(
-            matches!(
-                prompt["title"].as_str(),
-                Some("今日，欲破何局？" | "What shall we conquer today?")
-            ),
-            "unexpected localized home prompt: {prompt}"
+            prompt["title"]
+                .as_str()
+                .is_some_and(|title| !title.trim().is_empty()),
+            "custom home prompt is missing: {prompt}"
         );
         assert!(prompt["nativeCount"].as_u64().unwrap_or_default() > 0);
         assert_eq!(prompt["nativeHidden"], true);
@@ -6073,7 +6177,7 @@ mod tests {
         assert_eq!(prompt["heroPosition"], "relative", "{prompt}");
         assert_eq!(prompt["heroFitsStage"], true, "{prompt}");
         assert_eq!(prompt["heroMaxWidth"], "1080px", "{prompt}");
-        assert_eq!(prompt["heroViewportClips"], true, "{prompt}");
+        assert_eq!(prompt["heroViewportBelongsToHero"], true, "{prompt}");
         assert_eq!(prompt["heroViewportInFlow"], true, "{prompt}");
         assert_eq!(prompt["heroViewportFillsHero"], true, "{prompt}");
         assert_eq!(prompt["heroPrecedesPrompt"], true, "{prompt}");

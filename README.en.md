@@ -69,7 +69,7 @@ ReTheme detects the installed ChatGPT app on first launch. Closing the main wind
 
 ## Build a Theme
 
-Start with the [Theme Development Guide](docs/theme-development.en.md) and the [minimal example](docs/theme-example). A development theme is an unpacked directory and does not need `.ctheme` decryption or a platform signature.
+Start with the [Theme Development Guide](docs/theme-development.en.md) and the [loadable minimal example](docs/theme-example/package). A development theme is an unpacked directory and does not need `.ctheme` decryption or a platform signature.
 
 ```text
 theme-example/
@@ -79,6 +79,15 @@ theme-example/
 ```
 
 Choose “Load local theme” in ReTheme and select the directory containing `manifest.json`. For community publication, upload a source ZIP; the platform reviews, normalizes, signs, and produces the downloadable `.ctheme` package.
+
+The complete authoring kit also includes the [164 stable slots](docs/theme-slots.md), [Banner and image specifications with generation prompts](docs/theme-banner-assets.md), [Manifest JSON Schema](docs/theme.schema.json), [annotated Manifest](docs/theme-example/manifest.annotated.jsonc), and [deterministic AI workflow](docs/theme-ai-workflow.md). The repository's [`retheme-theme-development` Skill](skills/retheme-theme-development/SKILL.md) lets Codex and other AI agents create, validate, and review themes directly.
+
+Validate a source directory with the same Rust protocol checker used by the desktop app and server:
+
+```bash
+cargo run --manifest-path crates/theme-validator/Cargo.toml -- \
+  --directory /absolute/path/to/theme
+```
 
 ## Development
 
@@ -105,6 +114,10 @@ Configuration templates contain no production secrets. Maintainers should read t
 ## Links
 
 - [Theme Development Guide](docs/theme-development.en.md)
+- [Stable Slot Catalog](docs/theme-slots.md)
+- [Banner and Image Specifications](docs/theme-banner-assets.md)
+- [AI Theme Workflow](docs/theme-ai-workflow.md)
+- [Theme Development Skill](skills/retheme-theme-development/SKILL.md)
 - [中文主题开发规范](docs/theme-development.md)
 - [Security Model](docs/security.md)
 - [Release Guide](docs/releasing.md)

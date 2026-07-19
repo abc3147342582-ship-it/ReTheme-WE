@@ -69,7 +69,7 @@ ReTheme 桌面仓库不内置社区主题。主题在社区发布并按需下载
 
 ## 主题开发
 
-从 [主题开发规范](docs/theme-development.md) 和 [最小参考主题](docs/theme-example) 开始。开发主题是普通目录，不需要 `.ctheme` 解密或平台签名：
+从 [主题开发规范](docs/theme-development.md) 和 [可直接加载的最小参考主题](docs/theme-example/package) 开始。开发主题是普通目录，不需要 `.ctheme` 解密或平台签名：
 
 ```text
 theme-example/
@@ -79,6 +79,15 @@ theme-example/
 ```
 
 在 ReTheme 的“主题库”中选择“加载本地主题”，选中包含 `manifest.json` 的目录即可。正式发布时上传源码 ZIP，由平台审核、规范化、签名并生成 `.ctheme`。
+
+完整开发资料还包括 [164 个稳定插槽](docs/theme-slots.md)、[Banner 与图片规格/生图提示词](docs/theme-banner-assets.md)、[Manifest JSON Schema](docs/theme.schema.json)、[带注释 Manifest](docs/theme-example/manifest.annotated.jsonc) 与 [AI 确定性工作流](docs/theme-ai-workflow.md)。仓库内置的 [`retheme-theme-development` Skill](skills/retheme-theme-development/SKILL.md) 可供 Codex 等 AI 直接创建、检查和评审主题。
+
+使用与桌面端、服务端相同的 Rust 协议校验器验证源码目录：
+
+```bash
+cargo run --manifest-path crates/theme-validator/Cargo.toml -- \
+  --directory /absolute/path/to/theme
+```
 
 ## 本地开发
 
@@ -105,6 +114,10 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 ## 相关链接
 
 - [主题开发规范](docs/theme-development.md)
+- [稳定插槽目录](docs/theme-slots.md)
+- [Banner 与图片规范](docs/theme-banner-assets.md)
+- [AI 主题开发工作流](docs/theme-ai-workflow.md)
+- [主题开发 Skill](skills/retheme-theme-development/SKILL.md)
 - [Theme Development Guide](docs/theme-development.en.md)
 - [安全设计](docs/security.md)
 - [发版流程](docs/releasing.md)

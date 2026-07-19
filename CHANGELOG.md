@@ -2,6 +2,22 @@
 
 All notable ReTheme desktop changes are documented here.
 
+## [0.1.2] - 2026-07-19
+
+### Added
+
+- Add one shared Rust theme protocol and CLI validator for desktop loading, local authoring, AI workflows, and server-side community review.
+- Document the complete v1 Manifest schema, 164 stable slots, annotated examples, Banner asset specifications, generation prompts, and a reusable theme-development Skill.
+
+### Fixed
+
+- Refresh only the affected home slots while editing the composer, avoiding full runtime reinjection and related layout flicker.
+- Fully release theme observers and animation frames when replacing or restoring a runtime.
+
+### Security
+
+- Strictly reject unknown Manifest fields, unsafe archive paths, unscoped or structural CSS, external asset references, invalid image content, and unsafe SVG markup through the shared protocol gate.
+
 ## [0.1.1] - 2026-07-19
 
 ### Fixed

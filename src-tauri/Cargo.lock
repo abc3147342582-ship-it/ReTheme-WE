@@ -3512,6 +3512,7 @@ dependencies = [
  "plist",
  "rand_core 0.6.4",
  "reqwest 0.12.28",
+ "retheme-theme-protocol",
  "semver",
  "serde",
  "serde_json",
@@ -3530,6 +3531,17 @@ dependencies = [
  "tungstenite",
  "windows",
  "x25519-dalek",
+ "zip 8.6.0",
+]
+
+[[package]]
+name = "retheme-theme-protocol"
+version = "0.1.0"
+dependencies = [
+ "lightningcss",
+ "semver",
+ "serde",
+ "serde_json",
  "zip 8.6.0",
 ]
 
