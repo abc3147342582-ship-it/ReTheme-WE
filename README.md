@@ -69,18 +69,28 @@ ReTheme 桌面仓库不内置社区主题。主题在社区发布并按需下载
 
 ## 主题开发
 
-从 [主题开发规范](docs/theme-development.md) 和 [可直接加载的最小参考主题](docs/theme-example/package) 开始。开发主题是普通目录，不需要 `.ctheme` 解密或平台签名：
+开发主题是普通目录，不需要 `.ctheme` 解密或平台签名。建议按以下顺序阅读：
+
+1. [主题开发规范](docs/theme-development.md)：目录结构、Manifest、CSS、安全边界、双语和测试要求。
+2. [可直接加载的最小参考主题](docs/theme-example/package) 与 [带注释 Manifest](docs/theme-example/manifest.annotated.jsonc)：从可运行代码开始修改。
+3. [164 个稳定插槽](docs/theme-slots.md) 与 [Manifest JSON Schema](docs/theme.schema.json)：查找可覆盖区域和字段约束。
+4. [Banner 与图片规格/生图提示词](docs/theme-banner-assets.md)：制作首页 Hero、会话窄 Banner 和透明前景素材。
+5. [AI 主题开发工作流](docs/theme-ai-workflow.md)：让 AI 按固定步骤创建、校验和评审主题。
+
+### 手工开发
+
+复制最小主题，修改 `manifest.json`、`styles/` 和 `assets/`：
+
+```bash
+cp -R docs/theme-example/package /absolute/path/to/my-theme
+```
 
 ```text
-theme-example/
+my-theme/
 ├── manifest.json
 ├── styles/
 └── assets/
 ```
-
-在 ReTheme 的“主题库”中选择“加载本地主题”，选中包含 `manifest.json` 的目录即可。正式发布时上传源码 ZIP，由平台审核、规范化、签名并生成 `.ctheme`。
-
-完整开发资料还包括 [164 个稳定插槽](docs/theme-slots.md)、[Banner 与图片规格/生图提示词](docs/theme-banner-assets.md)、[Manifest JSON Schema](docs/theme.schema.json)、[带注释 Manifest](docs/theme-example/manifest.annotated.jsonc) 与 [AI 确定性工作流](docs/theme-ai-workflow.md)。仓库内置的 [`retheme-theme-development` Skill](skills/retheme-theme-development/SKILL.md) 可供 Codex 等 AI 直接创建、检查和评审主题。
 
 使用与桌面端、服务端相同的 Rust 协议校验器验证源码目录：
 
@@ -88,6 +98,48 @@ theme-example/
 cargo run --manifest-path crates/theme-validator/Cargo.toml -- \
   --directory /absolute/path/to/theme
 ```
+
+发布前还要校验最终 ZIP；ZIP 根目录必须直接包含 `manifest.json`：
+
+```bash
+cargo run --manifest-path crates/theme-validator/Cargo.toml -- \
+  --source /absolute/path/to/theme.zip
+```
+
+然后在 ReTheme 的“主题库”中选择“加载本地主题”，选中主题目录进行实际测试。正式发布时上传源码 ZIP，由平台审核、规范化、签名并生成 `.ctheme`。
+
+### 使用 AI Skill
+
+仓库内置 [`retheme-theme-development`](skills/retheme-theme-development/SKILL.md) Skill，包含协议、插槽、QA、Banner 生图规范、校验脚本和起始模板。它适合让 Codex 等支持 Skills 的 AI 创建新主题、补全现有主题或判断问题属于主题还是引擎。
+
+可以直接让 Codex 安装 GitHub 仓库中的 Skill：
+
+```text
+请安装 GitHub 仓库 duxweb/ReTheme 中 skills/retheme-theme-development 的 Skill。
+```
+
+也可以从本地仓库安装。macOS / Linux：
+
+```bash
+mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
+cp -R skills/retheme-theme-development "${CODEX_HOME:-$HOME/.codex}/skills/"
+```
+
+Windows PowerShell：
+
+```powershell
+$codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME ".codex" }
+New-Item -ItemType Directory -Force (Join-Path $codexHome "skills") | Out-Null
+Copy-Item -Recurse -Force skills/retheme-theme-development (Join-Path $codexHome "skills/retheme-theme-development")
+```
+
+安装后新开一个 Codex 会话，并直接描述任务，例如：
+
+```text
+使用 retheme-theme-development Skill，在 /path/to/my-theme 创建一套支持中英文和深浅模式的主题，完成校验但不要打包成 .ctheme。
+```
+
+AI 必须以共享校验器结果为准；不要为了迁就主题而放宽协议，也不要使用 ChatGPT 内部类名或改变原生布局。
 
 ## 本地开发
 
