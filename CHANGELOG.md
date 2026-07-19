@@ -2,6 +2,13 @@
 
 All notable ReTheme desktop changes are documented here.
 
+## [0.1.3] - 2026-07-19
+
+### Added
+
+- Allow controlled theme assets to declare `lightAsset` and `darkAsset` variants that switch with the ChatGPT appearance and fall back to `asset`.
+- Share the appearance-aware asset schema across desktop loading, the theme-development Skill, and server-side community validation.
+
 ## [0.1.2] - 2026-07-19
 
 ### Added

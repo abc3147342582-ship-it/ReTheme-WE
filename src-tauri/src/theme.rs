@@ -654,6 +654,16 @@ fn build_runtime_config_with(
             Ok(json!({
                 "slot": asset.slot,
                 "assetUrl": load_asset_url(&asset.asset)?,
+                "lightAssetUrl": asset
+                    .light_asset
+                    .as_deref()
+                    .map(&load_asset_url)
+                    .transpose()?,
+                "darkAssetUrl": asset
+                    .dark_asset
+                    .as_deref()
+                    .map(&load_asset_url)
+                    .transpose()?,
             }))
         })
         .collect::<Result<Vec<_>, ThemeError>>()?;
@@ -712,7 +722,10 @@ fn collect_runtime_asset_paths<'a>(value: &'a Value, paths: &mut HashSet<&'a str
     match value {
         Value::Object(object) => {
             for (key, value) in object {
-                if matches!(key.as_str(), "assetUrl" | "foregroundAssetUrl") {
+                if matches!(
+                    key.as_str(),
+                    "assetUrl" | "foregroundAssetUrl" | "lightAssetUrl" | "darkAssetUrl"
+                ) {
                     if let Some(path) = value.as_str() {
                         paths.insert(path);
                     }
@@ -968,7 +981,12 @@ mod tests {
     fn builds_controlled_asset_slot_runtime_config() {
         let mut manifest: Value = serde_json::from_str(TEST_THEME_MANIFEST).expect("test manifest");
         manifest["experience"]["assets"] = json!([
-            { "slot": "app.background", "asset": "assets/hero.svg" },
+            {
+                "slot": "app.background",
+                "asset": "assets/hero.svg",
+                "lightAsset": "assets/hero.svg",
+                "darkAsset": "assets/ornament.svg"
+            },
             { "slot": "main.background", "asset": "assets/hero.svg" },
             { "slot": "main.overlay", "asset": "assets/ornament.svg" },
             { "slot": "main.frame", "asset": "assets/ornament.svg" },
@@ -993,6 +1011,8 @@ mod tests {
         let config = build_runtime_config(&manifest, &files).expect("runtime config");
         assert_eq!(config["assets"].as_array().map(Vec::len), Some(9));
         assert_eq!(config["assets"][0]["slot"], "app.background");
+        assert_eq!(config["assets"][0]["lightAssetUrl"], "assets/hero.svg");
+        assert_eq!(config["assets"][0]["darkAssetUrl"], "assets/ornament.svg");
         assert_eq!(config["assets"][6]["slot"], "sidebar.header.decoration");
         assert_eq!(config["assets"][7]["slot"], "sidebar.frame");
         assert!(
@@ -1030,7 +1050,10 @@ mod tests {
         match value {
             Value::Object(object) => {
                 for (key, value) in object {
-                    if matches!(key.as_str(), "assetUrl" | "foregroundAssetUrl") {
+                    if matches!(
+                        key.as_str(),
+                        "assetUrl" | "foregroundAssetUrl" | "lightAssetUrl" | "darkAssetUrl"
+                    ) {
                         if let Some(url) = value.as_str() {
                             assert!(url.starts_with("http://127.0.0.1:"), "invalid URL: {url}");
                         }

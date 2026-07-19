@@ -86,6 +86,8 @@ Each is `{ "asset": "assets/file.ext" }`.
 
 ### `experience.assets`
 
+Each entry requires `{ "slot", "asset" }`. It may additionally provide `lightAsset` and `darkAsset`; the engine selects the current ChatGPT appearance and falls back to `asset` when that variant is absent.
+
 Allowed slots:
 
 `app.background`, `main.background`, `main.overlay`, `main.frame`, `sidebar.brand.icon`, `sidebar.brand.badge`, `sidebar.header.background`, `sidebar.header.decoration`, `sidebar.frame`, `home.card.background`, `home.card.arrow.asset`.

@@ -57,6 +57,14 @@
       "fit": "cover",
       "position": "center"
     },
+    "assets": [
+      {
+        "slot": "app.background",
+        "asset": "assets/hero.svg",
+        "lightAsset": "assets/hero.svg",
+        "darkAsset": "assets/hero.svg"
+      }
+    ],
     "decorations": []
   },
   "locales": {

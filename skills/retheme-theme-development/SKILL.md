@@ -60,6 +60,7 @@ Do not reference images from CSS. Put them under `assets/` and declare them in M
 ### 5. Write Manifest
 
 - Use only fields defined by the v1 protocol.
+- Use optional `lightAsset` and `darkAsset` only on controlled `experience.assets` entries when an image needs explicit appearance variants; keep `asset` as the fallback.
 - Keep `styles` and `slots` unique.
 - Declare every used stable slot.
 - Also declare every `experience.assets[].slot` in top-level `slots`.

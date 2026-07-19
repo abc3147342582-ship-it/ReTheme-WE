@@ -358,7 +358,7 @@ pub struct ThemeExperience {
     #[serde(default)]
     pub sidebar_section_decoration: Option<ThemeAsset>,
     #[serde(default)]
-    pub assets: Vec<ThemeDecoration>,
+    pub assets: Vec<ThemeControlledAsset>,
     #[serde(default)]
     pub decorations: Vec<ThemeDecoration>,
 }
@@ -412,6 +412,17 @@ pub struct ThemeHeroDivider {
     pub label: String,
     #[serde(default)]
     pub asset: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThemeControlledAsset {
+    pub slot: String,
+    pub asset: String,
+    #[serde(default)]
+    pub light_asset: Option<String>,
+    #[serde(default)]
+    pub dark_asset: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -633,6 +644,12 @@ pub fn validate_manifest(manifest: &ThemeManifest) -> Result<(), ThemeError> {
             return Err(ThemeError(format!("主题资源插槽重复：{}", asset.slot)));
         }
         validate_asset_path(&asset.asset)?;
+        if let Some(path) = &asset.light_asset {
+            validate_asset_path(path)?;
+        }
+        if let Some(path) = &asset.dark_asset {
+            validate_asset_path(path)?;
+        }
     }
     for decoration in &manifest.experience.decorations {
         if !matches!(
@@ -699,13 +716,17 @@ fn referenced_asset_paths(manifest: &ThemeManifest) -> HashSet<&str> {
     {
         paths.insert(&asset.asset);
     }
-    for asset in manifest
-        .experience
-        .assets
-        .iter()
-        .chain(manifest.experience.decorations.iter())
-    {
+    for asset in &manifest.experience.assets {
         paths.insert(&asset.asset);
+        if let Some(path) = asset.light_asset.as_deref() {
+            paths.insert(path);
+        }
+        if let Some(path) = asset.dark_asset.as_deref() {
+            paths.insert(path);
+        }
+    }
+    for decoration in &manifest.experience.decorations {
+        paths.insert(&decoration.asset);
     }
     paths
 }

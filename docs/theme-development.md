@@ -199,11 +199,22 @@ conversation.stage
 
 ### 6.5 通用图片插槽 `experience.assets`
 
-每项为 `{ "slot", "asset" }`。当前只允许：
+每项基础格式为 `{ "slot", "asset" }`。需要按 ChatGPT 明暗模式切换图片时，可增加可选字段 `lightAsset` 和 `darkAsset`；引擎会原位切换资源，缺少对应变体时回退到 `asset`：
+
+```json
+{
+  "slot": "app.background",
+  "asset": "assets/background.webp",
+  "lightAsset": "assets/background-light.webp",
+  "darkAsset": "assets/background-dark.webp"
+}
+```
+
+当前只允许：
 
 `app.background`、`main.background`、`main.overlay`、`main.frame`、`sidebar.brand.icon`、`sidebar.brand.badge`、`sidebar.header.background`、`sidebar.header.decoration`、`sidebar.frame`、`home.card.background`、`home.card.arrow.asset`。
 
-资源插槽必须同时列在顶层 `slots`。同一资源插槽只能声明一次。
+资源插槽必须同时列在顶层 `slots`。同一资源插槽只能声明一次。三种资源路径均须指向包内图片；复杂背景优先使用压缩后的 WebP。
 
 ### 6.6 角落装饰 `experience.decorations`
 

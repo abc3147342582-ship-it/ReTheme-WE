@@ -1524,6 +1524,7 @@ fn apply_theme(
                 ? 'dark'
                 : colorSchemeMedia.matches ? 'light' : 'dark';
             root.setAttribute('data-ct-color-scheme', scheme);
+            syncManagedAssetSchemes();
             return scheme;
           }};
 
@@ -1554,15 +1555,34 @@ fn apply_theme(
             (config.assets ?? []).map(asset => [asset.slot, asset])
           );
 
+          const assetUrlForScheme = asset => {{
+            if (!asset) return null;
+            const scheme = document.documentElement?.dataset.ctColorScheme;
+            return (scheme === 'light' ? asset.lightAssetUrl : asset.darkAssetUrl)
+              ?? asset.assetUrl
+              ?? null;
+          }};
+
+          const syncManagedAssetSchemes = () => {{
+            document.querySelectorAll('[data-ct-managed-asset][data-ct-mount]')
+              .forEach(mount => {{
+                const asset = assetsBySlot.get(mount.getAttribute('data-ct-mount'));
+                const assetUrl = assetUrlForScheme(asset);
+                const image = mount.querySelector('img');
+                if (image && assetUrl && image.src !== assetUrl) image.src = assetUrl;
+              }});
+          }};
+
           const syncAssetMount = (parent, slot, placement = 'append') => {{
             if (!parent) return null;
             const asset = assetsBySlot.get(slot);
-            if (!asset?.assetUrl) return null;
+            const assetUrl = assetUrlForScheme(asset);
+            if (!assetUrl) return null;
             let mount = [...parent.children].find(
               child => child.getAttribute('data-ct-mount') === slot
             );
             if (!mount) {{
-              mount = createAssetMount(slot, asset.assetUrl);
+              mount = createAssetMount(slot, assetUrl);
               if (['app.background', 'main.background', 'main.overlay', 'main.frame', 'sidebar.frame'].includes(slot)) {{
                 mount.style.position = 'absolute';
                 mount.style.inset = '0';
@@ -1572,14 +1592,15 @@ fn apply_theme(
             }} else {{
               mount.dataset.ctSlot = slot;
               const image = mount.querySelector('img');
-              if (image && image.src !== asset.assetUrl) image.src = asset.assetUrl;
+              if (image && image.src !== assetUrl) image.src = assetUrl;
             }}
             return mount;
           }};
 
           const syncCardArrowAsset = card => {{
             const asset = assetsBySlot.get('home.card.arrow.asset');
-            if (!asset?.assetUrl) return null;
+            const assetUrl = assetUrlForScheme(asset);
+            if (!assetUrl) return null;
             let mount = [...card.children].find(
               child => child.getAttribute('data-ct-mount') === 'home.card.arrow.asset'
             );
@@ -1594,7 +1615,7 @@ fn apply_theme(
               image.dataset.ctSlot = 'home.card.arrow.asset';
               image.alt = '';
               image.draggable = false;
-              image.src = asset.assetUrl;
+              image.src = assetUrl;
               mount.appendChild(image);
               card.appendChild(mount);
             }}
@@ -2533,7 +2554,8 @@ fn apply_theme(
                   card.prepend(background);
                 }}
                 const backgroundAsset = assetsBySlot.get('home.card.background');
-                if (backgroundAsset?.assetUrl) {{
+                const backgroundAssetUrl = assetUrlForScheme(backgroundAsset);
+                if (backgroundAssetUrl) {{
                   let backgroundImage = background.querySelector('img');
                   if (!backgroundImage) {{
                     backgroundImage = document.createElement('img');
@@ -2541,8 +2563,8 @@ fn apply_theme(
                     backgroundImage.draggable = false;
                     background.appendChild(backgroundImage);
                   }}
-                  if (backgroundImage.src !== backgroundAsset.assetUrl) {{
-                    backgroundImage.src = backgroundAsset.assetUrl;
+                  if (backgroundImage.src !== backgroundAssetUrl) {{
+                    backgroundImage.src = backgroundAssetUrl;
                   }}
                 }}
                 const iconContainers = [...card.children].filter(node => node.querySelector('svg'));
@@ -4573,6 +4595,17 @@ mod tests {
         assert!(PLATFORM_RUNTIME_CSS.contains("[data-ct-mount=\"app.background\"]"));
         assert!(PLATFORM_RUNTIME_CSS.contains("z-index: -1 !important"));
         assert!(PLATFORM_RUNTIME_CSS.contains("pointer-events: none !important"));
+    }
+
+    #[test]
+    fn controlled_assets_switch_with_chatgpt_appearance() {
+        let source = include_str!("codex.rs");
+
+        assert!(source.contains("const assetUrlForScheme = asset =>"));
+        assert!(source.contains("asset.lightAssetUrl"));
+        assert!(source.contains("asset.darkAssetUrl"));
+        assert!(source.contains("syncManagedAssetSchemes();"));
+        assert!(source.contains("const assetUrl = assetUrlForScheme(asset);"));
     }
 
     #[test]

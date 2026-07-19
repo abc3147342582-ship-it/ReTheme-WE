@@ -104,6 +104,20 @@ mod tests {
                 .and_then(|manifest| manifest["id"].as_str()),
             Some("studio.example.protocol-preview")
         );
+        assert_eq!(
+            report
+                .manifest
+                .as_ref()
+                .and_then(|manifest| manifest["experience"]["assets"][0]["lightAsset"].as_str()),
+            Some("assets/hero.svg")
+        );
+        assert_eq!(
+            report
+                .manifest
+                .as_ref()
+                .and_then(|manifest| manifest["experience"]["assets"][0]["darkAsset"].as_str()),
+            Some("assets/hero.svg")
+        );
         assert!(report.errors.is_empty());
         assert!(report.warnings.is_empty());
         serde_json::to_string(&report).expect("report must remain JSON serializable");

@@ -143,11 +143,13 @@ Each value is `{ "asset": "assets/file.svg" }`. Mounts are non-interactive and m
 
 ### General asset slots
 
+Each `experience.assets` entry uses `{ "slot", "asset" }`. Optional `lightAsset` and `darkAsset` paths provide appearance-specific images; the engine switches them in place and falls back to `asset` when a matching variant is absent.
+
 `experience.assets` accepts only:
 
 `app.background`, `main.background`, `main.overlay`, `main.frame`, `sidebar.brand.icon`, `sidebar.brand.badge`, `sidebar.header.background`, `sidebar.header.decoration`, `sidebar.frame`, `home.card.background`, `home.card.arrow.asset`.
 
-Declare each slot once in both `experience.assets` and top-level `slots`.
+Declare each slot once in both `experience.assets` and top-level `slots`. Every declared path must reference an image inside the package; prefer compressed WebP for complex backgrounds.
 
 `experience.decorations` may be omitted and defaults to `[]`. It accepts `decoration.top-right` and `decoration.bottom-right` only.
 
