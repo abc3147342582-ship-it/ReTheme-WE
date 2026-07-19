@@ -675,6 +675,8 @@ impl ThemeAssetServer {
         let routes = Arc::new(routes);
         let shutdown = Arc::new(AtomicBool::new(false));
         let server_shutdown = shutdown.clone();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let server_stopped = stopped.clone();
         let thread = thread::Builder::new()
             .name("retheme-assets".into())
             .spawn(move || {
@@ -696,6 +698,7 @@ impl ThemeAssetServer {
                             let routes = routes.clone();
                             let revoke_path = revoke_path.clone();
                             let shutdown = server_shutdown.clone();
+                            let stopped = server_stopped.clone();
                             if let Ok(connection) = thread::Builder::new()
                                 .name("retheme-asset-request".into())
                                 .spawn(move || {
@@ -705,6 +708,7 @@ impl ThemeAssetServer {
                                         &revoke_path,
                                         &routes,
                                         &shutdown,
+                                        &stopped,
                                     );
                                 })
                             {
@@ -717,6 +721,8 @@ impl ThemeAssetServer {
                         Err(_) => break,
                     }
                 }
+                drop(listener);
+                server_stopped.store(true, Ordering::Release);
                 connections
             })?;
         Ok((
@@ -751,6 +757,7 @@ fn serve_theme_asset_request(
     revoke_path: &str,
     routes: &HashMap<String, theme::ThemeRuntimeAsset>,
     shutdown: &AtomicBool,
+    stopped: &AtomicBool,
 ) -> std::io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(1)))?;
@@ -797,9 +804,11 @@ fn serve_theme_asset_request(
         })
     });
     if valid_host && path == revoke_path {
-        let result = write_theme_asset_error(stream, 204, "No Content");
         shutdown.store(true, Ordering::Release);
-        return result;
+        while !stopped.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+        return write_theme_asset_error(stream, 204, "No Content");
     }
     let Some(asset) = valid_host.then(|| routes.get(path)).flatten() else {
         return write_theme_asset_error(stream, 404, "Not Found");
@@ -5021,7 +5030,6 @@ mod tests {
         assert!(response.starts_with(b"HTTP/1.1 404 Not Found\r\n"));
         let response = get_theme_asset_response(&revoke_url, None);
         assert!(response.starts_with(b"HTTP/1.1 204 No Content\r\n"));
-        thread::sleep(Duration::from_millis(30));
         assert!(TcpStream::connect_timeout(&url_socket(url), Duration::from_millis(100)).is_err());
         drop(server);
         assert!(TcpStream::connect_timeout(&url_socket(url), Duration::from_millis(100)).is_err());
