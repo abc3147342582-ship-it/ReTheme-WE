@@ -573,10 +573,32 @@ impl ThemeRepository {
     }
 
     pub fn list(&self) -> Result<Vec<ThemeSummary>, ThemeError> {
+        let mut registry = self.read_registry()?;
         let mut themes = Vec::new();
-        for (theme_id, installed) in self.read_registry()?.themes {
-            let package = self.load_installed(&theme_id, &installed)?;
-            themes.push(package.summary(false, Some(&installed.online)));
+        let mut invalid_theme_ids = Vec::new();
+        for (theme_id, installed) in &registry.themes {
+            match self.load_installed(theme_id, installed) {
+                Ok(package) => themes.push(package.summary(false, Some(&installed.online))),
+                Err(_) => invalid_theme_ids.push(theme_id.clone()),
+            }
+        }
+        if !invalid_theme_ids.is_empty() {
+            let removed = invalid_theme_ids
+                .into_iter()
+                .filter_map(|theme_id| registry.themes.remove(&theme_id))
+                .collect::<Vec<_>>();
+            let registry_bytes = serde_json::to_vec_pretty(&registry)
+                .map_err(|error| ThemeError(format!("无法保存主题注册表：{error}")))?;
+            write_atomic(&self.registry_path(), &registry_bytes)?;
+            for installed in removed {
+                if !registry
+                    .themes
+                    .values()
+                    .any(|item| item.digest == installed.digest)
+                {
+                    let _ = fs::remove_file(self.store_path(&installed.digest));
+                }
+            }
         }
         Ok(themes)
     }
@@ -671,10 +693,8 @@ impl ThemeRepository {
 
         fs::create_dir_all(self.store_dir())?;
         let store_path = self.store_path(&digest);
-        if !store_path.exists() {
-            let stored = self.encrypt_online_cache(&digest, archive_bytes)?;
-            write_atomic(&store_path, &stored)?;
-        }
+        let stored = self.encrypt_online_cache(&digest, archive_bytes)?;
+        write_atomic(&store_path, &stored)?;
         registry.themes.insert(
             package.id().to_owned(),
             InstalledTheme {
@@ -2192,6 +2212,72 @@ mod tests {
             .load("studio.example.test-theme")
             .expect_err("registry source tampering must fail");
         assert!(error.to_string().contains("授权策略与服务端不一致"));
+    }
+
+    #[test]
+    fn removes_online_cache_encrypted_for_another_device() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().join("repository");
+        let signing_key = SigningKey::from_bytes(&TEST_SECRET);
+        let first_device = ThemeRepository {
+            root: root.clone(),
+            verifying_key: signing_key.verifying_key(),
+            cache_key: Some([9; 32]),
+        };
+        first_device
+            .install_online(&signed_online_test_package(), "test-theme".into())
+            .expect("first device install");
+
+        let current_device = ThemeRepository {
+            root,
+            verifying_key: signing_key.verifying_key(),
+            cache_key: Some([10; 32]),
+        };
+        assert!(
+            current_device
+                .list()
+                .expect("stale cache cleanup")
+                .is_empty()
+        );
+        assert!(
+            current_device
+                .read_registry()
+                .expect("cleaned registry")
+                .themes
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn reinstall_reencrypts_online_cache_for_current_device() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().join("repository");
+        let package = signed_online_test_package();
+        let signing_key = SigningKey::from_bytes(&TEST_SECRET);
+        let first_device = ThemeRepository {
+            root: root.clone(),
+            verifying_key: signing_key.verifying_key(),
+            cache_key: Some([9; 32]),
+        };
+        first_device
+            .install_online(&package, "test-theme".into())
+            .expect("first device install");
+
+        let current_device = ThemeRepository {
+            root,
+            verifying_key: signing_key.verifying_key(),
+            cache_key: Some([10; 32]),
+        };
+        current_device
+            .install_online(&package, "test-theme".into())
+            .expect("current device reinstall");
+        assert_eq!(
+            current_device
+                .load("studio.example.test-theme")
+                .expect("current device cache")
+                .id(),
+            "studio.example.test-theme"
+        );
     }
 
     #[test]

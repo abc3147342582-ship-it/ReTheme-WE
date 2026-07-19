@@ -2,6 +2,12 @@
 
 All notable ReTheme desktop changes are documented here.
 
+## [0.1.1] - 2026-07-19
+
+### Fixed
+
+- Recover installed themes after reinstalling ReTheme on Windows when an old device-encrypted cache can no longer be opened.
+
 ## [0.1.0] - 2026-07-19
 
 ### Added
