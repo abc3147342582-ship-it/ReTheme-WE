@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 const packageDirectory = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repository = resolve(packageDirectory, "../..");
 const temporary = mkdtempSync(join(tmpdir(), "retheme-skill-package-"));
+const packageVersion = JSON.parse(readFileSync(resolve(packageDirectory, "package.json"), "utf8")).version;
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -39,7 +40,7 @@ try {
   const sourceZip = resolve(temporary, "created-theme.zip");
 
   const version = run("pnpm", ["dlx", archive, "--version"]);
-  if (version !== "0.1.0") throw new Error(`Unexpected CLI version: ${version}`);
+  if (version !== packageVersion) throw new Error(`Unexpected CLI version: ${version}`);
 
   run("pnpm", ["dlx", archive, "install", "--target", skill]);
   run("pnpm", ["dlx", archive, "create", createdTheme]);
