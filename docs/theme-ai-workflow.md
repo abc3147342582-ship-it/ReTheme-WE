@@ -68,14 +68,13 @@
 - CSS 每个使用的 slot 都写入 Manifest。
 - 无未引用图片、重复样式或重复插槽。
 
-每次修改 Manifest、CSS 或图片后运行共享 Rust 校验器，不得用其他脚本替代协议结论：
+每次修改 Manifest、CSS 或图片后运行 Skill 自带的共享校验器，不得用其他脚本替代协议结论：
 
 ```bash
-cargo run --manifest-path crates/theme-validator/Cargo.toml -- \
-  --directory /absolute/path/to/theme
+node /absolute/path/to/retheme-theme-development/scripts/validate-theme.mjs /absolute/path/to/theme
 ```
 
-提交前还要将源码压成根目录直接包含 `manifest.json` 的 ZIP，并使用 `--source` 再校验一次。
+提交前还要将源码压成根目录直接包含 `manifest.json` 的 ZIP，并使用同一脚本再校验一次。Skill 由 `pnpm dlx @duxweb/retheme-theme-skill install` 安装，不依赖 ReTheme 源码、Rust 或 Cargo。
 
 ### 阶段 F：真实验收
 

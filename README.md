@@ -69,71 +69,39 @@ ReTheme 桌面仓库不内置社区主题。主题在社区发布并按需下载
 
 ## 主题开发
 
-开发主题是普通目录，不需要 `.ctheme` 解密或平台签名。建议按以下顺序阅读：
-
-1. [主题开发规范](docs/theme-development.md)：目录结构、Manifest、CSS、安全边界、双语和测试要求。
-2. [可直接加载的最小参考主题](docs/theme-example/package) 与 [带注释 Manifest](docs/theme-example/manifest.annotated.jsonc)：从可运行代码开始修改。
-3. [164 个稳定插槽](docs/theme-slots.md) 与 [Manifest JSON Schema](docs/theme.schema.json)：查找可覆盖区域和字段约束。
-4. [Banner 与图片规格/生图提示词](docs/theme-banner-assets.md)：制作首页 Hero、会话窄 Banner 和透明前景素材。
-5. [AI 主题开发工作流](docs/theme-ai-workflow.md)：让 AI 按固定步骤创建、校验和评审主题。
+开发主题是普通目录，不需要克隆 ReTheme 源码，也不需要 Rust、Cargo、`.ctheme` 解密或平台签名。只选择以下一种方式即可。
 
 ### 手工开发
 
-复制最小主题，修改 `manifest.json`、`styles/` 和 `assets/`：
+完整规则、字段、插槽、双语、明暗模式、Banner 规格和验收要求统一见 [主题开发规范](docs/theme-development.md)。创建最小主题：
 
 ```bash
-cp -R docs/theme-example/package /absolute/path/to/my-theme
+pnpm dlx @duxweb/retheme-theme-skill create ./my-theme
 ```
 
-```text
-my-theme/
-├── manifest.json
-├── styles/
-└── assets/
-```
-
-使用与桌面端、服务端相同的 Rust 协议校验器验证源码目录：
+修改 `manifest.json`、`styles/` 和 `assets/`，再使用与桌面端、服务端相同的校验器验证目录：
 
 ```bash
-cargo run --manifest-path crates/theme-validator/Cargo.toml -- \
-  --directory /absolute/path/to/theme
+pnpm dlx @duxweb/retheme-theme-skill validate ./my-theme
 ```
 
-发布前还要校验最终 ZIP；ZIP 根目录必须直接包含 `manifest.json`：
+发布前同样校验源码 ZIP：
 
 ```bash
-cargo run --manifest-path crates/theme-validator/Cargo.toml -- \
-  --source /absolute/path/to/theme.zip
+pnpm dlx @duxweb/retheme-theme-skill validate ./my-theme.zip
 ```
 
-然后在 ReTheme 的“主题库”中选择“加载本地主题”，选中主题目录进行实际测试。正式发布时上传源码 ZIP，由平台审核、规范化、签名并生成 `.ctheme`。
+在 ReTheme 中选择“加载本地主题”进行实际测试。正式发布时上传根目录直接包含 `manifest.json` 的源码 ZIP，由平台审核并生成 `.ctheme`。
 
 ### 使用 AI Skill
 
-仓库内置 [`retheme-theme-development`](skills/retheme-theme-development/SKILL.md) Skill，包含协议、插槽、QA、Banner 生图规范、校验脚本和起始模板。它适合让 Codex 等支持 Skills 的 AI 创建新主题、补全现有主题或判断问题属于主题还是引擎。
-
-可以直接让 Codex 安装 GitHub 仓库中的 Skill：
-
-```text
-请安装 GitHub 仓库 duxweb/ReTheme 中 skills/retheme-theme-development 的 Skill。
-```
-
-也可以从本地仓库安装。macOS / Linux：
+一条命令安装完整 Skill：
 
 ```bash
-mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
-cp -R skills/retheme-theme-development "${CODEX_HOME:-$HOME/.codex}/skills/"
+pnpm dlx @duxweb/retheme-theme-skill install
 ```
 
-Windows PowerShell：
-
-```powershell
-$codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME ".codex" }
-New-Item -ItemType Directory -Force (Join-Path $codexHome "skills") | Out-Null
-Copy-Item -Recurse -Force skills/retheme-theme-development (Join-Path $codexHome "skills/retheme-theme-development")
-```
-
-安装后新开一个 Codex 会话，并直接描述任务，例如：
+安装包已包含详细协议、插槽、QA、Banner 生图提示词、起始模板和当前系统的编译版校验器。无需下载本仓库。重启 Codex 后直接描述任务：
 
 ```text
 使用 retheme-theme-development Skill，在 /path/to/my-theme 创建一套支持中英文和深浅模式的主题，完成校验但不要打包成 .ctheme。
@@ -166,10 +134,7 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 ## 相关链接
 
 - [主题开发规范](docs/theme-development.md)
-- [稳定插槽目录](docs/theme-slots.md)
-- [Banner 与图片规范](docs/theme-banner-assets.md)
-- [AI 主题开发工作流](docs/theme-ai-workflow.md)
-- [主题开发 Skill](skills/retheme-theme-development/SKILL.md)
+- [AI Skill 安装](packages/retheme-theme-skill/README.md)
 - [Theme Development Guide](docs/theme-development.en.md)
 - [安全设计](docs/security.md)
 - [发版流程](docs/releasing.md)

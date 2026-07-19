@@ -18,7 +18,7 @@ package/
 2. 修改 `manifest.json` 的 `id`、名称、版本、作者、文案和预览色。
 3. 先在 `tokens.css` 建立浅色与深色语义 token，再在 `overrides.css` 映射稳定插槽。
 4. 使用 ReTheme 的“加载本地主题”选择复制后的目录。
-5. 使用共享校验器执行 `retheme-theme-validator --directory /path/to/theme`。
+5. 执行 `pnpm dlx @duxweb/retheme-theme-skill validate /path/to/theme`。
 6. 只压缩 `package/` 内部内容，确保 ZIP 根目录直接出现 `manifest.json`。
 
 字段解释见 [`manifest.annotated.jsonc`](manifest.annotated.jsonc)。该 JSONC 仅供阅读，不能放入实际主题包。CSS 中的注释可以保留，校验器会正常解析。

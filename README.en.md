@@ -69,71 +69,39 @@ ReTheme detects the installed ChatGPT app on first launch. Closing the main wind
 
 ## Build a Theme
 
-A development theme is an unpacked directory and does not need `.ctheme` decryption or a platform signature. Read the authoring kit in this order:
-
-1. [Theme Development Guide](docs/theme-development.en.md): package structure, Manifest, CSS, security boundaries, localization, and QA.
-2. [Loadable minimal example](docs/theme-example/package) and [annotated Manifest](docs/theme-example/manifest.annotated.jsonc): start from working code.
-3. [164 stable slots](docs/theme-slots.md) and [Manifest JSON Schema](docs/theme.schema.json): find supported surfaces and field constraints.
-4. [Banner and image specifications with generation prompts](docs/theme-banner-assets.md): create the home Hero, compact conversation Banner, and transparent foreground assets.
-5. [Deterministic AI workflow](docs/theme-ai-workflow.md): make an AI agent create, validate, and review a theme consistently.
+A development theme is an unpacked directory. You do not need to clone ReTheme source, install Rust or Cargo, decrypt `.ctheme`, or hold a platform key. Choose either workflow below.
 
 ### Manual workflow
 
-Copy the minimal theme, then edit `manifest.json`, `styles/`, and `assets/`:
+The [Theme Development Guide](docs/theme-development.en.md) is the single manual reference for fields, slots, localization, appearances, Banner assets, and QA. Create a minimal theme with:
 
 ```bash
-cp -R docs/theme-example/package /absolute/path/to/my-theme
+pnpm dlx @duxweb/retheme-theme-skill create ./my-theme
 ```
 
-```text
-my-theme/
-├── manifest.json
-├── styles/
-└── assets/
-```
-
-Validate a source directory with the same Rust protocol checker used by the desktop app and server:
+Edit `manifest.json`, `styles/`, and `assets/`, then validate the directory with the same checker used by the desktop app and server:
 
 ```bash
-cargo run --manifest-path crates/theme-validator/Cargo.toml -- \
-  --directory /absolute/path/to/theme
+pnpm dlx @duxweb/retheme-theme-skill validate ./my-theme
 ```
 
-Validate the final ZIP as well. Its root must directly contain `manifest.json`:
+Validate the final source ZIP as well:
 
 ```bash
-cargo run --manifest-path crates/theme-validator/Cargo.toml -- \
-  --source /absolute/path/to/theme.zip
+pnpm dlx @duxweb/retheme-theme-skill validate ./my-theme.zip
 ```
 
-Choose “Load local theme” in ReTheme and select the theme directory for real-app testing. For community publication, upload the source ZIP; the platform reviews, normalizes, signs, and produces the downloadable `.ctheme` package.
+Choose “Load local theme” in ReTheme for real-app testing. For community publication, upload a source ZIP whose root directly contains `manifest.json`; the platform reviews it and creates the `.ctheme` package.
 
 ### Use the AI Skill
 
-The bundled [`retheme-theme-development`](skills/retheme-theme-development/SKILL.md) Skill contains the protocol, slot catalog, QA matrix, Banner generation rules, validation script, and starter template. It helps Codex and other Skill-capable agents create themes, complete existing themes, or determine whether a defect belongs to the theme or engine.
-
-Ask Codex to install the Skill directly from GitHub:
-
-```text
-Install the Skill at skills/retheme-theme-development from the duxweb/ReTheme GitHub repository.
-```
-
-Or install it from a local checkout. macOS / Linux:
+Install the complete Skill with one command:
 
 ```bash
-mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
-cp -R skills/retheme-theme-development "${CODEX_HOME:-$HOME/.codex}/skills/"
+pnpm dlx @duxweb/retheme-theme-skill install
 ```
 
-Windows PowerShell:
-
-```powershell
-$codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME ".codex" }
-New-Item -ItemType Directory -Force (Join-Path $codexHome "skills") | Out-Null
-Copy-Item -Recurse -Force skills/retheme-theme-development (Join-Path $codexHome "skills/retheme-theme-development")
-```
-
-Start a new Codex session after installation and describe the task directly:
+The package contains the full protocol, slots, QA, Banner prompts, starter template, and a compiled validator for the current platform. No repository checkout is needed. Restart Codex and describe the task directly:
 
 ```text
 Use the retheme-theme-development Skill to create a bilingual light/dark theme in /path/to/my-theme. Validate it, but do not package it as .ctheme.
@@ -166,10 +134,7 @@ Configuration templates contain no production secrets. Maintainers should read t
 ## Links
 
 - [Theme Development Guide](docs/theme-development.en.md)
-- [Stable Slot Catalog](docs/theme-slots.md)
-- [Banner and Image Specifications](docs/theme-banner-assets.md)
-- [AI Theme Workflow](docs/theme-ai-workflow.md)
-- [Theme Development Skill](skills/retheme-theme-development/SKILL.md)
+- [AI Skill installation](packages/retheme-theme-skill/README.md)
 - [中文主题开发规范](docs/theme-development.md)
 - [Security Model](docs/security.md)
 - [Release Guide](docs/releasing.md)

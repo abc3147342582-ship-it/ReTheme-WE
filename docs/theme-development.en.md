@@ -69,14 +69,14 @@ my-theme/
 6. Remove structural CSS, overflow, flicker, poor contrast, and interactive overlays.
 7. Bump SemVer, ZIP the directory contents, and submit the source ZIP.
 
-Validate a directory or ZIP with the shared native Rust CLI:
+Validate a directory or ZIP without cloning ReTheme or installing Rust:
 
 ```bash
-retheme-theme-validator --directory /absolute/path/to/my-theme
-retheme-theme-validator --source /absolute/path/to/my-theme.zip
+pnpm dlx @duxweb/retheme-theme-skill validate /absolute/path/to/my-theme
+pnpm dlx @duxweb/retheme-theme-skill validate /absolute/path/to/my-theme.zip
 ```
 
-The CLI writes one JSON report to stdout. Exit code `0` means valid, `1` means a protocol failure, and `2` means invalid CLI usage. The desktop app calls the same pure Rust crate directly; PHP invokes the compiled Linux CLI. The protocol core is not WASM and is not duplicated in PHP.
+The npm package invokes the compiled Rust validator for the current platform and writes one JSON report to stdout. Exit code `0` means valid, `1` means a protocol failure, and `2` means invalid CLI usage. Desktop, server, and authoring tools share the same protocol implementation; it is not WASM and is not duplicated in JavaScript or PHP.
 
 ## 5. Strict Manifest
 
@@ -257,12 +257,10 @@ When a slot disappears after a ChatGPT update, reproduce with another known-good
 
 ## 15. AI entry point
 
-An AI must also read:
+Install the complete Skill instead of asking an AI to reconstruct rules from this document:
 
-1. [`theme-ai-workflow.md`](theme-ai-workflow.md) for deterministic sequencing.
-2. [`theme-slots.md`](theme-slots.md) for all 164 slot boundaries.
-3. [`theme.schema.json`](theme.schema.json) for exact machine fields.
-4. [`theme-banner-assets.md`](theme-banner-assets.md) before generating visual assets.
-5. [`theme-example`](theme-example/README.md) for commented, runnable code.
+```bash
+pnpm dlx @duxweb/retheme-theme-skill install
+```
 
-The repository includes [`skills/retheme-theme-development`](../skills/retheme-theme-development/SKILL.md) as a reusable AI theme-development Skill.
+Restart Codex, then ask it to use `retheme-theme-development` to create, improve, or review a theme. The Skill loads its bundled protocol, slot, QA, Banner, and template references as needed and does not require a ReTheme repository checkout.

@@ -72,21 +72,19 @@ my-theme/
 6. 修复所有横向滚动、遮挡、闪烁、低对比和交互区域被覆盖问题。
 7. 升级 SemVer，压缩源码目录为 ZIP，提交社区。
 
-本地静态校验：
+本地静态校验无需下载 ReTheme 源码或安装 Rust：
 
 ```bash
-cargo run --manifest-path crates/theme-validator/Cargo.toml -- \
-  --directory /absolute/path/to/my-theme
+pnpm dlx @duxweb/retheme-theme-skill validate /absolute/path/to/my-theme
 ```
 
 校验 ZIP：
 
 ```bash
-cargo run --manifest-path crates/theme-validator/Cargo.toml -- \
-  --source /absolute/path/to/my-theme.zip
+pnpm dlx @duxweb/retheme-theme-skill validate /absolute/path/to/my-theme.zip
 ```
 
-CLI 始终在 stdout 输出 JSON：成功退出码为 `0`，协议失败为 `1`，命令用法错误为 `2`。桌面端直接调用同一个纯 Rust crate；PHP 服务端调用该 crate 编译出的 Linux CLI，不使用 WASM，也不维护第二套协议实现。
+npm 包会自动调用当前系统对应的编译版 Rust 校验器，并始终在 stdout 输出 JSON：成功退出码为 `0`，协议失败为 `1`，命令用法错误为 `2`。桌面端、服务端和开发工具共享同一协议实现，不使用 WASM，也不在 JavaScript 或 PHP 中维护第二套校验规则。
 
 ## 5. Manifest 完整字段
 
@@ -442,12 +440,10 @@ SVG 会拒绝脚本、`foreignObject`、事件属性、外部 URL 和 JavaScript
 
 ## 19. 给 AI 的入口
 
-AI 不应只读本文件就直接写主题。必须同时读取：
+不要让 AI 临时拼接本规范中的规则。安装完整 Skill 后，它会按需读取协议、插槽、QA、Banner 生图提示词和模板，并调用内置校验器：
 
-1. [`theme-ai-workflow.md`](theme-ai-workflow.md)：固定开发顺序和交付清单。
-2. [`theme-slots.md`](theme-slots.md)：插槽边界和条件。
-3. [`theme.schema.json`](theme.schema.json)：机器字段协议。
-4. [`theme-banner-assets.md`](theme-banner-assets.md)：资源规格与中英文生图提示词。
-5. [`theme-example`](theme-example/README.md)：可运行包与带注释代码。
+```bash
+pnpm dlx @duxweb/retheme-theme-skill install
+```
 
-仓库还提供 [`skills/retheme-theme-development`](../skills/retheme-theme-development/SKILL.md)，可直接安装或调用为主题开发 Skill。
+重启 Codex 后，直接要求使用 `retheme-theme-development` Skill 创建、优化或检查主题即可，不需要下载 ReTheme 仓库。

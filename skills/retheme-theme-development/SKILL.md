@@ -16,7 +16,7 @@ Read these references before editing:
 3. Read [`references/qa.md`](references/qa.md) before debugging or declaring completion.
 4. Read [`references/banner-generation.md`](references/banner-generation.md) before generating or editing a Hero, compact Banner, or transparent foreground.
 
-Do not infer fields or slots from memory. Use `docs/theme.schema.json` when working inside the ReTheme repository.
+Do not infer fields or slots from memory. Treat the bundled validator as the protocol authority.
 
 ## Workflow
 
@@ -83,13 +83,13 @@ Never use ChatGPT internal classes, localized text selectors, arbitrary attribut
 
 ### 7. Validate continuously
 
-Run:
+Run the validator bundled in this installed Skill:
 
 ```bash
-skills/retheme-theme-development/scripts/validate-theme.sh /absolute/path/to/theme
+node /absolute/path/to/retheme-theme-development/scripts/validate-theme.mjs /absolute/path/to/theme
 ```
 
-The script calls an installed `retheme-theme-validator` or the repository's shared Rust CLI. Treat every error as blocking. Do not weaken the validator to accept a theme workaround.
+Resolve the script relative to this `SKILL.md`, so the command works with custom `CODEX_HOME` paths and on Windows. Treat every validator error as blocking. Do not look for a ReTheme source checkout, require Cargo, or weaken the validator to accept a theme workaround.
 
 ### 8. Test in ChatGPT
 
