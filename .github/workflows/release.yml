@@ -252,13 +252,11 @@ jobs:
           latest_asset_id="$(jq -r '.[] | select(.name == "latest.json") | .id' release-assets.json)"
           [[ -n "$latest_asset_id" ]] || { echo "latest.json asset is missing" >&2; exit 1; }
           gh api -H "Accept: application/octet-stream" "repos/${{ github.repository }}/releases/assets/$latest_asset_id" > release/latest.json
-          jq --arg repository "${{ github.repository }}" --arg tag "$tag" '
-            .platforms |= with_entries(
-              .value.url as $url |
-              .value.url = ("https://github.com/\($repository)/releases/download/\($tag)/" + ($url | split("/") | last))
-            )
-          ' release/latest.json > release/latest.normalized.json
-          mv release/latest.normalized.json release/latest.json
+          node scripts/normalize-updater-metadata.mjs \
+            release/latest.json \
+            release-assets.json \
+            "${{ github.repository }}" \
+            "$tag"
           bash scripts/upload-release-asset.sh "$release_id" latest.json release/latest.json
       - name: Verify updater metadata
         env:
@@ -276,6 +274,7 @@ jobs:
               all(.[];
                 . as $platform |
                 ($platforms[$platform].url | startswith($release_root)) and
+                ($platforms[$platform].url | test("/[0-9]+$") | not) and
                 ($platforms[$platform].signature != "")
               )
             )
