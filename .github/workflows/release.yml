@@ -305,10 +305,10 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release edit "${{ needs.prepare.outputs.tag }}" --repo "${{ github.repository }}" --draft=false --latest
+        run: bash scripts/publish-release.sh "${{ needs.prepare.outputs.release_id }}" "${{ needs.prepare.outputs.tag }}"
 
   apple-remote:
-    name: Apple remote verification (${{ matrix.asset_arch }})
+    name: Apple remote verification
     needs: [prepare, publish]
     strategy:
       fail-fast: false
