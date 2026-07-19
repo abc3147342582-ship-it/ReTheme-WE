@@ -374,7 +374,7 @@ function DevicesPage({ account, accountSync, syncError }: { account: AccountStat
   );
 }
 
-function SettingsPage({ preferences, onToggle, installation, onDetect, onRestore, stopping, previewReport, runtimeEnvironment, account, appearance, onAppearanceChange, update, updateChecking, updateInstalling, updateError, onCheckUpdate, onInstallUpdate }: { preferences: DesktopPreferences; onToggle: (key: keyof DesktopPreferences) => void; installation: CodexInstallation | null; onDetect: () => void; onRestore: () => void; stopping: boolean; previewReport: ThemePreviewReport | null; runtimeEnvironment: RuntimeEnvironment | null; account: AccountStatus; appearance: Appearance; onAppearanceChange: (value: Appearance) => void; update: DesktopUpdate | null; updateChecking: boolean; updateInstalling: boolean; updateError: string; onCheckUpdate: () => void; onInstallUpdate: () => void }) {
+function SettingsPage({ preferences, onToggle, installation, onDetect, onRestore, stopping, previewReport, runtimeEnvironment, account, appearance, onAppearanceChange, update, updateChecked, updateChecking, updateInstalling, updateError, onCheckUpdate, onInstallUpdate }: { preferences: DesktopPreferences; onToggle: (key: keyof DesktopPreferences) => void; installation: CodexInstallation | null; onDetect: () => void; onRestore: () => void; stopping: boolean; previewReport: ThemePreviewReport | null; runtimeEnvironment: RuntimeEnvironment | null; account: AccountStatus; appearance: Appearance; onAppearanceChange: (value: Appearance) => void; update: DesktopUpdate | null; updateChecked: boolean; updateChecking: boolean; updateInstalling: boolean; updateError: string; onCheckUpdate: () => void; onInstallUpdate: () => void }) {
   const { preference, setPreference, t } = useI18n();
   const heartbeat = heartbeatCopy(account, t);
   const appearanceOptions: Array<{ value: Appearance; label: string }> = [{ value: "system", label: t("common.system") }, { value: "light", label: t("common.light") }, { value: "dark", label: t("common.dark") }];
@@ -404,7 +404,7 @@ function SettingsPage({ preferences, onToggle, installation, onDetect, onRestore
         <div className="settings-group">
           <h2>{t("settings.update")}</h2>
           <div className="setting-row"><div><strong>{t("settings.autoUpdate")}</strong><p>{t("settings.autoUpdateDetail")}</p></div><Switch checked={preferences.autoUpdate} label={t("settings.autoUpdate")} onChange={() => onToggle("autoUpdate")} /></div>
-          <div className="setting-row"><div><strong>{t("settings.currentVersion")}</strong><p>{update ? t("settings.available", { version: update.version }) : t("settings.stableChannel", { version: runtimeEnvironment?.appVersion ?? "—" })}</p>{update?.body && <p className="update-notes">{update.body}</p>}{updateError && <p className="error-line">{updateError}</p>}</div><button className={`button ${update ? "secondary" : "ghost"}`} disabled={updateChecking || updateInstalling} onClick={update ? onInstallUpdate : onCheckUpdate}>{updateInstalling ? t("settings.installing") : updateChecking ? t("settings.checking") : update ? t("settings.installUpdate") : t("settings.checkNow")}</button></div>
+          <div className="setting-row"><div><strong>{t("settings.currentVersion")}</strong><p>{update ? t("settings.available", { version: update.version }) : updateChecked ? t("settings.latestVersion", { version: runtimeEnvironment?.appVersion ?? "—" }) : t("settings.stableChannel", { version: runtimeEnvironment?.appVersion ?? "—" })}</p>{update?.body && <p className="update-notes">{update.body}</p>}{updateError && <p className="error-line">{updateError}</p>}</div><button className={`button ${update ? "secondary" : "ghost"}`} disabled={updateChecking || updateInstalling} onClick={update ? onInstallUpdate : onCheckUpdate}>{updateInstalling ? t("settings.installing") : updateChecking ? t("settings.checking") : update ? t("settings.installUpdate") : t("settings.checkNow")}</button></div>
         </div>
         <div className="settings-group">
           <h2>{t("settings.themeService")}</h2>
@@ -450,6 +450,7 @@ function App() {
   const [preferences, setPreferences] = useState(INITIAL_PREFERENCES);
   const [appearance, setAppearance] = useState<Appearance>(loadAppearance);
   const [update, setUpdate] = useState<DesktopUpdate | null>(null);
+  const [updateChecked, setUpdateChecked] = useState(false);
   const [updateChecking, setUpdateChecking] = useState(false);
   const [updateInstalling, setUpdateInstalling] = useState(false);
   const [updateError, setUpdateError] = useState("");
@@ -484,10 +485,15 @@ function App() {
 
   async function checkUpdate(silent = false) {
     if (!isDesktopRuntime()) return;
-    if (!silent) setUpdateChecking(true);
+    if (!silent) {
+      setUpdateChecked(false);
+      setUpdateChecking(true);
+    }
     setUpdateError("");
     try {
-      setUpdate(await checkForUpdate());
+      const availableUpdate = await checkForUpdate();
+      setUpdate(availableUpdate);
+      if (!silent && !availableUpdate) setUpdateChecked(true);
     } catch (error) {
       setUpdateError(String(error));
     } finally {
@@ -771,7 +777,7 @@ function App() {
         {page === "favorites" && <FavoritesPage account={account} accountSync={accountSync} syncError={syncError} installError={installError} themes={localizedThemes} onlineInstallingSlug={onlineInstallingSlug} onInstallOnline={(slug) => void installOnlineTheme(slug)} />}
         {page === "account" && <AccountPage account={account} onManage={() => setAccountOpen(true)} />}
         {page === "devices" && <DevicesPage account={account} accountSync={accountSync} syncError={syncError} />}
-        {page === "settings" && <SettingsPage preferences={preferences} onToggle={(key) => setPreferences((current) => ({ ...current, [key]: !current[key] }))} installation={installation} onDetect={() => void detect()} onRestore={() => void stopTheme()} stopping={stopping} previewReport={previewReport} runtimeEnvironment={runtimeEnvironment} account={account} appearance={appearance} onAppearanceChange={setAppearance} update={update} updateChecking={updateChecking} updateInstalling={updateInstalling} updateError={updateError} onCheckUpdate={() => void checkUpdate()} onInstallUpdate={() => void installUpdate()} />}
+        {page === "settings" && <SettingsPage preferences={preferences} onToggle={(key) => setPreferences((current) => ({ ...current, [key]: !current[key] }))} installation={installation} onDetect={() => void detect()} onRestore={() => void stopTheme()} stopping={stopping} previewReport={previewReport} runtimeEnvironment={runtimeEnvironment} account={account} appearance={appearance} onAppearanceChange={setAppearance} update={update} updateChecked={updateChecked} updateChecking={updateChecking} updateInstalling={updateInstalling} updateError={updateError} onCheckUpdate={() => void checkUpdate()} onInstallUpdate={() => void installUpdate()} />}
       </div>
 
       <AccountDialog open={accountOpen} status={account} notice={oauthMessage} onClose={() => setAccountOpen(false)} onChange={setAccount} />

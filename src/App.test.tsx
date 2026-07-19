@@ -389,6 +389,16 @@ describe("ReTheme desktop shell", () => {
     expect(launch).toHaveAttribute("aria-checked", "true");
   });
 
+  test("shows feedback when the app is up to date", async () => {
+    desktop.isDesktopRuntime.mockReturnValue(true);
+    desktop.checkForUpdate.mockResolvedValue(null);
+    renderApp();
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    fireEvent.click(await screen.findByRole("button", { name: "检查更新" }));
+
+    expect(await screen.findByText("ReTheme 0.1.0 · 已是最新版本")).toBeInTheDocument();
+  });
+
   test("restores the active theme before installing an update", async () => {
     desktop.isDesktopRuntime.mockReturnValue(true);
     desktop.restoreOfficialTheme.mockClear();

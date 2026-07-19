@@ -24,3 +24,16 @@ test("synchronizes every desktop version source", () => {
   const check = spawnSync(process.execPath, [join(projectRoot, "scripts/sync-version.mjs"), "1.2.3", "--check", "--root", root], { encoding: "utf8" });
   assert.equal(check.status, 0, check.stderr);
 });
+
+test("uses the positional version when root is the current directory", () => {
+  const root = mkdtempSync(join(tmpdir(), "retheme-version-cwd-"));
+  for (const relativePath of ["package.json", "src-tauri/tauri.conf.json", "src-tauri/Cargo.toml", "src-tauri/Cargo.lock"]) {
+    mkdirSync(dirname(join(root, relativePath)), { recursive: true });
+    cpSync(join(projectRoot, relativePath), join(root, relativePath), { recursive: true });
+  }
+
+  const sync = spawnSync(process.execPath, [join(projectRoot, "scripts/sync-version.mjs"), "v1.2.3"], { cwd: root, encoding: "utf8" });
+  assert.equal(sync.status, 0, sync.stderr);
+  assert.equal(JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version, "1.2.3");
+  assert.equal(JSON.parse(readFileSync(join(root, "src-tauri/tauri.conf.json"), "utf8")).version, "1.2.3");
+});

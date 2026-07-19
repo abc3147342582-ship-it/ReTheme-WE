@@ -5,7 +5,7 @@ const args = process.argv.slice(2);
 const check = args.includes("--check");
 const rootIndex = args.indexOf("--root");
 const root = resolve(rootIndex >= 0 ? args[rootIndex + 1] : ".");
-const rawVersion = args.find((arg, index) => !arg.startsWith("--") && index !== rootIndex + 1);
+const rawVersion = args.find((arg, index) => !arg.startsWith("--") && (rootIndex < 0 || index !== rootIndex + 1));
 const version = (rawVersion ?? JSON.parse(readFileSync(resolve(root, "package.json"), "utf8")).version)?.replace(/^v/, "");
 
 if (!version || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {

@@ -7,6 +7,8 @@ All notable ReTheme desktop changes are documented here.
 ### Fixed
 
 - Recover installed themes after reinstalling ReTheme on Windows when an old device-encrypted cache can no longer be opened.
+- Show a clear result after manually checking for updates, including when ReTheme is already up to date.
+- Build tagged releases with the tag version across application metadata and updater manifests.
 
 ## [0.1.0] - 2026-07-19
 
