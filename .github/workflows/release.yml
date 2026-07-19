@@ -54,13 +54,13 @@ jobs:
 
           release_id="$(gh api "repos/${{ github.repository }}/releases?per_page=100" --paginate --jq ".[] | select(.tag_name == \"$tag\") | .id" | head -n 1)"
           if [[ -z "$release_id" ]]; then
-            gh release create "$tag" \
-              --repo "${{ github.repository }}" \
-              --target "$GITHUB_SHA" \
-              --title "ReTheme v$version" \
-              --notes-file "$notes_path" \
-              --draft
-            release_id="$(gh api "repos/${{ github.repository }}/releases?per_page=100" --paginate --jq ".[] | select(.tag_name == \"$tag\") | .id" | head -n 1)"
+            release_id="$(gh api --method POST "repos/${{ github.repository }}/releases" \
+              -f tag_name="$tag" \
+              -f target_commitish="$GITHUB_SHA" \
+              -f name="ReTheme v$version" \
+              -f body="$(cat "$notes_path")" \
+              -F draft=true \
+              --jq .id)"
           fi
           [[ -n "$release_id" ]] || { echo "Unable to resolve draft release ID" >&2; exit 1; }
 
@@ -70,6 +70,7 @@ jobs:
           gh api --method PATCH "repos/${{ github.repository }}/releases/$release_id" \
             -f name="ReTheme v$version" \
             -f body="$(cat "$notes_path")" \
+            -f target_commitish="$GITHUB_SHA" \
             >/dev/null
 
           {

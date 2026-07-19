@@ -20,9 +20,29 @@
   简体中文 | <a href="README.en.md">English</a>
 </p>
 
+<p align="center">
+  <img src="docs/images/retheme-light-dark.png" alt="ReTheme 深色与浅色界面预览">
+</p>
+
 ---
 
 ReTheme 把主题作者面对的稳定逻辑插槽与 ChatGPT 的版本适配分开。主题只声明颜色、样式、图片和双语文案；匹配规则由签名兼容数据独立更新，因此 ChatGPT 升级时通常无需重新发布主题或桌面应用。
+
+## 主题预览
+
+主题可以统一覆盖 ChatGPT 的背景、首页横幅、建议卡片、输入框、侧栏、菜单、图标、设置页与会话界面，同时保留原生交互和自适应布局。
+
+### 齐天 · 暗色国风
+
+<p align="center">
+  <img src="docs/images/theme-qitian.png" alt="齐天暗色国风主题预览">
+</p>
+
+### 莓果 · 浅色手帐
+
+<p align="center">
+  <img src="docs/images/theme-berry.png" alt="莓果浅色手帐主题预览">
+</p>
 
 ## 功能
 

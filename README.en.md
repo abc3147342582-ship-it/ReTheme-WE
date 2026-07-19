@@ -20,9 +20,29 @@
   <a href="README.md">简体中文</a> | English
 </p>
 
+<p align="center">
+  <img src="docs/images/retheme-light-dark.png" alt="ReTheme dark and light interface preview">
+</p>
+
 ---
 
 ReTheme separates the stable logical slots used by theme authors from version-specific ChatGPT adaptation. A theme declares colors, CSS, images, and localized copy, while signed compatibility data can update independently when ChatGPT changes.
+
+## Theme Preview
+
+A theme can consistently cover ChatGPT backgrounds, home banners, suggestion cards, the composer, sidebar, menus, icons, settings, and conversations while preserving native interactions and responsive layout.
+
+### Qitian · Dark Mythic Style
+
+<p align="center">
+  <img src="docs/images/theme-qitian.png" alt="Qitian dark mythic theme preview">
+</p>
+
+### Berry · Light Journal Style
+
+<p align="center">
+  <img src="docs/images/theme-berry.png" alt="Berry light journal theme preview">
+</p>
 
 ## Highlights
 
