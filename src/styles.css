@@ -471,6 +471,10 @@ button:focus-visible {
 .version-card > div { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
 .version-card strong { font-size: 18px; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .version-card small { overflow: hidden; color: var(--quiet); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.support-card { width: 100%; border-color: var(--accent-line); color: var(--ink); background: color-mix(in srgb, var(--accent) 16%, var(--surface)); cursor: pointer; text-align: left; transition: border-color 140ms ease, background 140ms ease, transform 140ms ease; }
+.support-card > span, .support-card small { color: color-mix(in srgb, var(--accent) 52%, var(--ink)); }
+.support-card:hover { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 23%, var(--surface)); transform: translateY(-1px); }
+.support-card svg { flex: 0 0 auto; margin-left: auto; color: var(--accent); }
 
 /* ============ 主题库 ============ */
 

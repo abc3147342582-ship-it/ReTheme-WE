@@ -108,6 +108,14 @@ export async function syncThemeLocale(locale: string): Promise<void> {
 
 export async function openWebsite(path = ""): Promise<void> {
   const url = `https://retheme.app${path}`;
+  await openExternalUrl(url);
+}
+
+export async function openGitHubRepository(): Promise<void> {
+  await openExternalUrl("https://github.com/duxweb/ReTheme");
+}
+
+async function openExternalUrl(url: string): Promise<void> {
   if (!isDesktopRuntime()) {
     window.open(url, "_blank", "noopener,noreferrer");
     return;

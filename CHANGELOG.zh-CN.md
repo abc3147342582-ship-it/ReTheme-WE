@@ -2,6 +2,17 @@
 
 这里记录 ReTheme 桌面端的重要变更。
 
+## [0.1.4] - 2026-07-20
+
+### 新增
+
+- 概览页新增 GitHub Star 支持入口，方便用户前往支持开源项目。
+
+### 修复
+
+- 修复 Windows Microsoft Store/MSIX 版 ChatGPT 位于 `WindowsApps` 时无法应用主题的问题。
+- 通过系统 AppUserModelId 激活隔离 ChatGPT，并精确回收本次激活的进程。
+
 ## [0.1.3] - 2026-07-19
 
 ### 新增

@@ -2,6 +2,17 @@
 
 All notable ReTheme desktop changes are documented here.
 
+## [0.1.4] - 2026-07-20
+
+### Added
+
+- Add a GitHub Star support entry to the overview for users who want to support the open-source project.
+
+### Fixed
+
+- Fix theme activation for the Microsoft Store/MSIX ChatGPT package installed under `WindowsApps`.
+- Launch the isolated ChatGPT instance through its system AppUserModelId and reclaim only the process returned by that activation.
+
 ## [0.1.3] - 2026-07-19
 
 ### Added

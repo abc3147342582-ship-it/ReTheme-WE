@@ -12,6 +12,7 @@ import {
   getThemePreviewStatus,
   isDesktopRuntime,
   listThemes,
+  openGitHubRepository,
   openWebsite,
   restoreOfficialTheme,
   runSmokeTest,
@@ -223,8 +224,10 @@ function OverviewPage(props: SharedPageProps & { runtimeEnvironment: RuntimeEnvi
 
       <div className="version-grid">
         <article className="version-card"><span>ReTheme</span><div><strong>v{props.runtimeEnvironment?.appVersion ?? "—"}</strong><small>{t("overview.desktopApp")}</small></div></article>
-        <article className="version-card"><span>{t("overview.themeEngine")}</span><div><strong>v{props.runtimeEnvironment?.themeRuntimeVersion ?? "—"}</strong><small>{t("overview.localRuntime")}</small></div></article>
         <article className="version-card"><span>{t("overview.compatibility")}</span><div><strong>{compatibilityTitle}</strong><small>{compatibility?.adapterId ?? t("overview.waitingMatch")}</small></div></article>
+        <button className="version-card support-card" onClick={() => void openGitHubRepository()} aria-label={t("overview.supportAction")}>
+          <span>{t("overview.support")}</span><div><strong>GitHub Star</strong><small>{t("overview.openSource")}</small><Icon name="external" size={15} /></div>
+        </button>
       </div>
     </section>
   );

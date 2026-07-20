@@ -7,6 +7,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+#[cfg(any(not(target_os = "windows"), test))]
 use std::process::{Child, Command, Stdio};
 use std::sync::{
     Arc,
@@ -16,6 +17,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use tungstenite::{Message, WebSocket, client};
+
+#[cfg(target_os = "windows")]
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
 #[cfg(all(test, target_os = "macos"))]
 use tungstenite::connect;
@@ -531,7 +535,7 @@ fn platform_runtime_css() -> String {
         PLATFORM_RUNTIME_CSS.to_owned()
     }
 }
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const PROCESS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const REQUIRED_GLOBAL_STARTUP_SLOTS: &[&str] = &["app.shell", "titlebar", "sidebar", "main"];
 const REQUIRED_COMPOSER_STARTUP_SLOTS: &[&str] = &[
@@ -589,6 +593,8 @@ pub struct CodexInstallation {
     path: PathBuf,
     executable: PathBuf,
     bundle_id: String,
+    #[cfg(target_os = "windows")]
+    app_user_model_id: String,
     version: String,
 }
 
@@ -629,10 +635,25 @@ struct DevToolsTarget {
     web_socket_debugger_url: String,
 }
 
+#[cfg_attr(all(target_os = "windows", not(test)), allow(dead_code))]
+enum IsolatedProcess {
+    Native {
+        child: Child,
+        #[cfg(target_os = "macos")]
+        process_group_id: Option<i32>,
+    },
+    #[cfg(target_os = "windows")]
+    WindowsStore(WindowsStoreProcess),
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsStoreProcess {
+    id: u32,
+    handle: OwnedHandle,
+}
+
 struct TestInstance {
-    child: Child,
-    #[cfg(target_os = "macos")]
-    process_group_id: Option<i32>,
+    process: IsolatedProcess,
     _profile: TempDir,
 }
 
@@ -870,7 +891,7 @@ impl ThemeRuntime {
                 let expired_or_exited = session
                     .deadline
                     .is_some_and(|deadline| Instant::now() >= deadline)
-                    || session.instance.child.try_wait()?.is_some();
+                    || session.instance.process.has_exited()?;
                 if expired_or_exited {
                     true
                 } else {
@@ -951,25 +972,109 @@ pub struct ThemePreviewReport {
 
 impl Drop for TestInstance {
     fn drop(&mut self) {
-        #[cfg(target_os = "macos")]
-        if let Some(process_group_id) = self.process_group_id {
-            signal_process_group(process_group_id, libc::SIGTERM);
-            let started = Instant::now();
-            while process_group_exists(process_group_id)
-                && started.elapsed() < PROCESS_SHUTDOWN_TIMEOUT
-            {
-                let _ = self.child.try_wait();
-                thread::sleep(Duration::from_millis(25));
-            }
-            if process_group_exists(process_group_id) {
-                signal_process_group(process_group_id, libc::SIGKILL);
-            }
-        } else {
-            let _ = self.child.kill();
+        self.process.terminate();
+    }
+}
+
+impl IsolatedProcess {
+    fn id(&self) -> u32 {
+        match self {
+            Self::Native { child, .. } => child.id(),
+            #[cfg(target_os = "windows")]
+            Self::WindowsStore(process) => process.id,
         }
-        #[cfg(not(target_os = "macos"))]
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+    }
+
+    fn has_exited(&mut self) -> Result<bool, CodexError> {
+        match self {
+            Self::Native { child, .. } => Ok(child.try_wait()?.is_some()),
+            #[cfg(target_os = "windows")]
+            Self::WindowsStore(process) => process.has_exited(),
+        }
+    }
+
+    fn terminate(&mut self) {
+        match self {
+            Self::Native {
+                child,
+                #[cfg(target_os = "macos")]
+                process_group_id,
+            } => {
+                #[cfg(target_os = "macos")]
+                if let Some(process_group_id) = process_group_id {
+                    signal_process_group(*process_group_id, libc::SIGTERM);
+                    let started = Instant::now();
+                    while process_group_exists(*process_group_id)
+                        && started.elapsed() < PROCESS_SHUTDOWN_TIMEOUT
+                    {
+                        let _ = child.try_wait();
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                    if process_group_exists(*process_group_id) {
+                        signal_process_group(*process_group_id, libc::SIGKILL);
+                    }
+                } else {
+                    let _ = child.kill();
+                }
+                #[cfg(not(target_os = "macos"))]
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            #[cfg(target_os = "windows")]
+            Self::WindowsStore(process) => process.terminate(),
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsStoreProcess {
+    fn open(id: u32) -> Result<Self, CodexError> {
+        use windows::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+        };
+
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
+                false,
+                id,
+            )
+        }
+        .map_err(|error| CodexError(format!("无法管理隔离 ChatGPT 进程 {id}：{error}")))?;
+        let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+        Ok(Self { id, handle })
+    }
+
+    fn has_exited(&self) -> Result<bool, CodexError> {
+        use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows::Win32::System::Threading::WaitForSingleObject;
+
+        let handle = HANDLE(self.handle.as_raw_handle());
+        match unsafe { WaitForSingleObject(handle, 0) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            status => Err(CodexError(format!(
+                "无法读取隔离 ChatGPT 进程 {} 状态：等待结果 {}",
+                self.id, status.0
+            ))),
+        }
+    }
+
+    fn terminate(&self) {
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+
+        if self.has_exited().unwrap_or(true) {
+            return;
+        }
+        let handle = HANDLE(self.handle.as_raw_handle());
+        let _ = unsafe { TerminateProcess(handle, 0) };
+        let _ = unsafe {
+            WaitForSingleObject(
+                handle,
+                PROCESS_SHUTDOWN_TIMEOUT.as_millis().min(u32::MAX as u128) as u32,
+            )
+        };
     }
 }
 
@@ -1043,14 +1148,31 @@ fn inspect_windows_package() -> Result<CodexInstallation, CodexError> {
         let package_version = id
             .Version()
             .map_err(|error| CodexError(format!("无法读取 ChatGPT 版本：{error}")))?;
+        let family_name = id
+            .FamilyName()
+            .map_err(|error| CodexError(format!("无法读取 ChatGPT 包族：{error}")))?
+            .to_string();
+        let entries = package
+            .GetAppListEntries()
+            .map_err(|error| CodexError(format!("无法读取 ChatGPT 应用入口：{error}")))?;
+        let app_user_model_id = (0..entries
+            .Size()
+            .map_err(|error| CodexError(format!("无法读取 ChatGPT 应用入口数量：{error}")))?)
+            .filter_map(|index| entries.GetAt(index).ok())
+            .filter_map(|entry| entry.AppUserModelId().ok())
+            .map(|app_user_model_id| app_user_model_id.to_string())
+            .find(|app_user_model_id| {
+                app_user_model_id
+                    .strip_prefix(&family_name)
+                    .is_some_and(|application_id| application_id.starts_with('!'))
+            })
+            .ok_or_else(|| CodexError("ChatGPT 安装包没有可激活的应用入口".into()))?;
         return Ok(CodexInstallation {
             app_name: "ChatGPT".to_owned(),
             path,
             executable,
-            bundle_id: id
-                .FamilyName()
-                .map_err(|error| CodexError(format!("无法读取 ChatGPT 包族：{error}")))?
-                .to_string(),
+            bundle_id: family_name,
+            app_user_model_id,
             version: format!(
                 "{}.{}.{}.{}",
                 package_version.Major,
@@ -1106,11 +1228,11 @@ pub fn run_smoke_test() -> Result<SmokeTestReport, CodexError> {
     let started_at = Instant::now();
     let installation = detect()?;
     let mut instance = start_isolated(&installation)?;
-    let (port, _) = wait_for_devtools(instance._profile.path(), &mut instance.child)?;
+    let (port, _) = wait_for_devtools(instance._profile.path(), &mut instance.process)?;
     let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-    let loopback_only = verify_loopback(socket, instance.child.id())?;
+    let loopback_only = verify_loopback(socket, instance.process.id())?;
     let version: DevToolsVersion = get_json(port, "/json/version")?;
-    let target = wait_for_codex_target(port, &mut instance.child)?;
+    let target = wait_for_codex_target(port, &mut instance.process)?;
 
     let (probe_applied, probe_removed) = test_injection(&target.web_socket_debugger_url)?;
     if !probe_applied || !probe_removed {
@@ -1205,10 +1327,10 @@ fn start_theme_package_preview(
     let adapter = compatibility.adapter(&installation.version);
 
     let mut instance = start_isolated(&installation)?;
-    let (port, _) = wait_for_devtools(instance._profile.path(), &mut instance.child)?;
+    let (port, _) = wait_for_devtools(instance._profile.path(), &mut instance.process)?;
     let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-    let loopback_only = verify_loopback(socket, instance.child.id())?;
-    let target = wait_for_codex_target(port, &mut instance.child)?;
+    let loopback_only = verify_loopback(socket, instance.process.id())?;
+    let target = wait_for_codex_target(port, &mut instance.process)?;
     let session_id = runtime.next_session_id();
     let remaining = expires_at.map(remaining_until).transpose()?.flatten();
     let (asset_server, asset_urls, revoke_assets_url) =
@@ -1287,7 +1409,7 @@ pub fn stop_theme_preview(runtime: &ThemeRuntime) -> Result<bool, CodexError> {
         return Ok(false);
     };
 
-    if session.instance.child.try_wait()?.is_some() {
+    if session.instance.process.has_exited()? {
         return Ok(true);
     }
 
@@ -4011,11 +4133,14 @@ fn renew_theme_lease_expression(session_id: u64, duration: Duration) -> String {
     )
 }
 
-fn wait_for_codex_target(port: u16, child: &mut Child) -> Result<DevToolsTarget, CodexError> {
+fn wait_for_codex_target(
+    port: u16,
+    process: &mut IsolatedProcess,
+) -> Result<DevToolsTarget, CodexError> {
     let started = Instant::now();
     while started.elapsed() < STARTUP_TIMEOUT {
-        if let Some(status) = child.try_wait()? {
-            return Err(CodexError(format!("隔离 ChatGPT 提前退出：{status}")));
+        if process.has_exited()? {
+            return Err(CodexError("隔离 ChatGPT 提前退出".into()));
         }
         if let Ok(Some(target)) = find_codex_target(port, Duration::from_millis(500)) {
             return Ok(target);
@@ -4040,37 +4165,154 @@ fn start_isolated(installation: &CodexInstallation) -> Result<TestInstance, Code
     let profile = tempfile::Builder::new()
         .prefix("codex-theme-smoke-")
         .tempdir()?;
-    let mut command = Command::new(&installation.executable);
-    command
-        .arg(format!("--user-data-dir={}", profile.path().display()))
-        .arg("--remote-debugging-address=127.0.0.1")
-        .arg("--remote-debugging-port=0")
-        .arg("--disable-background-timer-throttling")
-        .arg("--no-first-run")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(target_os = "macos")]
-    command.process_group(0);
-    let child = command
-        .spawn()
-        .map_err(|error| CodexError(format!("无法启动隔离 ChatGPT：{error}")))?;
-    #[cfg(target_os = "macos")]
-    let process_group_id = Some(child.id() as i32);
-    Ok(TestInstance {
-        child,
+
+    #[cfg(target_os = "windows")]
+    {
+        let arguments = isolated_launch_arguments(profile.path());
+        let command_line = windows_command_line(&arguments);
+        let process = activate_windows_store_app(&installation.app_user_model_id, &command_line)?;
+        return Ok(TestInstance {
+            process: IsolatedProcess::WindowsStore(process),
+            _profile: profile,
+        });
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut command = Command::new(&installation.executable);
+        command
+            .args(isolated_launch_arguments(profile.path()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         #[cfg(target_os = "macos")]
-        process_group_id,
-        _profile: profile,
-    })
+        command.process_group(0);
+        let child = command
+            .spawn()
+            .map_err(|error| CodexError(format!("无法启动隔离 ChatGPT：{error}")))?;
+        #[cfg(target_os = "macos")]
+        let process_group_id = Some(child.id() as i32);
+        Ok(TestInstance {
+            process: IsolatedProcess::Native {
+                child,
+                #[cfg(target_os = "macos")]
+                process_group_id,
+            },
+            _profile: profile,
+        })
+    }
 }
 
-fn wait_for_devtools(profile: &Path, child: &mut Child) -> Result<(u16, String), CodexError> {
+fn isolated_launch_arguments(profile: &Path) -> Vec<String> {
+    vec![
+        format!("--user-data-dir={}", profile.display()),
+        "--remote-debugging-address=127.0.0.1".into(),
+        "--remote-debugging-port=0".into(),
+        "--disable-background-timer-throttling".into(),
+        "--no-first-run".into(),
+    ]
+}
+
+#[cfg(target_os = "windows")]
+fn windows_command_line(arguments: &[String]) -> String {
+    arguments
+        .iter()
+        .map(|argument| quote_windows_argument(argument))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(target_os = "windows")]
+fn quote_windows_argument(argument: &str) -> String {
+    if !argument.is_empty()
+        && !argument
+            .chars()
+            .any(|character| matches!(character, ' ' | '\t' | '"'))
+    {
+        return argument.to_owned();
+    }
+    let mut quoted = String::from('"');
+    let mut backslashes = 0;
+    for character in argument.chars() {
+        match character {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                quoted.extend(std::iter::repeat_n('\\', backslashes));
+                quoted.push(character);
+                backslashes = 0;
+            }
+        }
+    }
+    quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
+    quoted.push('"');
+    quoted
+}
+
+#[cfg(target_os = "windows")]
+fn activate_windows_store_app(
+    app_user_model_id: &str,
+    arguments: &str,
+) -> Result<WindowsStoreProcess, CodexError> {
+    use windows::Win32::System::Com::{
+        CLSCTX_LOCAL_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+    };
+    use windows::Win32::UI::Shell::{
+        AO_NONE, ApplicationActivationManager, IApplicationActivationManager,
+    };
+    use windows::core::HSTRING;
+
+    struct ComApartment(bool);
+
+    impl Drop for ComApartment {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe { CoUninitialize() };
+            }
+        }
+    }
+
+    let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    let initialized_here = if initialized.is_ok() {
+        true
+    } else if initialized == windows::Win32::Foundation::RPC_E_CHANGED_MODE {
+        false
+    } else {
+        return Err(CodexError(format!(
+            "无法初始化 Windows 应用激活环境：{}",
+            windows::core::Error::from_hresult(initialized)
+        )));
+    };
+    let _apartment = ComApartment(initialized_here);
+    let manager: IApplicationActivationManager =
+        unsafe { CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_LOCAL_SERVER) }
+            .map_err(|error| CodexError(format!("无法创建 Windows 应用激活管理器：{error}")))?;
+    let app_user_model_id = HSTRING::from(app_user_model_id);
+    let arguments = HSTRING::from(arguments);
+    let process_id =
+        unsafe { manager.ActivateApplication(&app_user_model_id, &arguments, AO_NONE) }.map_err(
+            |error| {
+                CodexError(format!(
+                    "无法通过 Windows 应用入口启动隔离 ChatGPT：{error}"
+                ))
+            },
+        )?;
+    WindowsStoreProcess::open(process_id)
+}
+
+fn wait_for_devtools(
+    profile: &Path,
+    process: &mut IsolatedProcess,
+) -> Result<(u16, String), CodexError> {
     let active_port_file = profile.join("DevToolsActivePort");
     let started = Instant::now();
     while started.elapsed() < STARTUP_TIMEOUT {
-        if let Some(status) = child.try_wait()? {
-            return Err(CodexError(format!("隔离 ChatGPT 提前退出：{status}")));
+        if process.has_exited()? {
+            return Err(CodexError("隔离 ChatGPT 提前退出".into()));
         }
         if let Ok(contents) = fs::read_to_string(&active_port_file) {
             let mut lines = contents.lines();
@@ -4420,9 +4662,11 @@ mod tests {
             .expect("test child should start");
         child.wait().expect("test child should exit");
         TestInstance {
-            child,
-            #[cfg(target_os = "macos")]
-            process_group_id: None,
+            process: IsolatedProcess::Native {
+                child,
+                #[cfg(target_os = "macos")]
+                process_group_id: None,
+            },
             _profile: tempfile::tempdir().expect("test profile"),
         }
     }
@@ -4444,11 +4688,41 @@ mod tests {
             .spawn()
             .expect("test child should start");
         TestInstance {
-            child,
-            #[cfg(target_os = "macos")]
-            process_group_id: None,
+            process: IsolatedProcess::Native {
+                child,
+                #[cfg(target_os = "macos")]
+                process_group_id: None,
+            },
             _profile: tempfile::tempdir().expect("test profile"),
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn quotes_msix_activation_arguments_using_windows_command_line_rules() {
+        assert_eq!(quote_windows_argument("--no-first-run"), "--no-first-run");
+        assert_eq!(
+            quote_windows_argument("--user-data-dir=C:\\Users\\Test User\\profile"),
+            "\"--user-data-dir=C:\\Users\\Test User\\profile\""
+        );
+        assert_eq!(quote_windows_argument(""), "\"\"");
+        assert_eq!(quote_windows_argument("a\\\\\"b"), "\"a\\\\\\\\\\\"b\"");
+        assert_eq!(
+            quote_windows_argument("C:\\path with space\\"),
+            "\"C:\\path with space\\\\\""
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn builds_msix_activation_command_line_with_isolated_profile() {
+        let arguments = isolated_launch_arguments(Path::new("C:\\Temp\\ReTheme Profile"));
+        let command_line = windows_command_line(&arguments);
+
+        assert!(command_line.starts_with("\"--user-data-dir=C:\\Temp\\ReTheme Profile\" "));
+        assert!(command_line.contains("--remote-debugging-address=127.0.0.1"));
+        assert!(command_line.contains("--remote-debugging-port=0"));
+        assert!(command_line.ends_with("--no-first-run"));
     }
 
     fn serve_devtools_target_responses(responses: Vec<&'static str>) -> u16 {
@@ -5045,8 +5319,8 @@ mod tests {
         let installation = detect().expect("ChatGPT App installation");
         let mut instance = start_isolated(&installation).expect("isolated ChatGPT App");
         let (port, _) =
-            wait_for_devtools(instance._profile.path(), &mut instance.child).expect("devtools");
-        let target = wait_for_codex_target(port, &mut instance.child).expect("ChatGPT page");
+            wait_for_devtools(instance._profile.path(), &mut instance.process).expect("devtools");
+        let target = wait_for_codex_target(port, &mut instance.process).expect("ChatGPT page");
         let (mut socket, _) = connect(&target.web_socket_debugger_url).expect("theme socket");
         let expression = format!(
             r#"(() => {{
@@ -5181,8 +5455,8 @@ mod tests {
         let installation = detect().expect("ChatGPT App installation");
         let mut instance = start_isolated(&installation).expect("isolated ChatGPT App");
         let (port, _) =
-            wait_for_devtools(instance._profile.path(), &mut instance.child).expect("devtools");
-        wait_for_codex_target(port, &mut instance.child).expect("ChatGPT page");
+            wait_for_devtools(instance._profile.path(), &mut instance.process).expect("devtools");
+        wait_for_codex_target(port, &mut instance.process).expect("ChatGPT page");
         let asset = theme::ThemeRuntimeAsset {
             path: "assets/test.svg".into(),
             mime: "image/svg+xml".into(),
@@ -5272,7 +5546,7 @@ mod tests {
         let websocket_url = {
             let mut session = runtime.session.lock().expect("theme session");
             let session = session.as_mut().expect("active theme session");
-            wait_for_codex_target(session.port, &mut session.instance.child)
+            wait_for_codex_target(session.port, &mut session.instance.process)
                 .expect("ChatGPT App page")
                 .web_socket_debugger_url
         };
@@ -5363,8 +5637,10 @@ mod tests {
         let child = command.spawn().expect("grouped test process");
         let process_group_id = child.id() as i32;
         let instance = TestInstance {
-            child,
-            process_group_id: Some(process_group_id),
+            process: IsolatedProcess::Native {
+                child,
+                process_group_id: Some(process_group_id),
+            },
             _profile: tempfile::tempdir().expect("test profile"),
         };
 
@@ -5725,9 +6001,9 @@ mod tests {
     fn external_theme_hides_native_main_fade() {
         let installation = detect().expect("ChatGPT App installation");
         let mut instance = start_isolated(&installation).expect("isolated ChatGPT App");
-        let (port, _) = wait_for_devtools(instance._profile.path(), &mut instance.child)
+        let (port, _) = wait_for_devtools(instance._profile.path(), &mut instance.process)
             .expect("local theme channel");
-        let target = wait_for_codex_target(port, &mut instance.child).expect("ChatGPT App page");
+        let target = wait_for_codex_target(port, &mut instance.process).expect("ChatGPT App page");
         let adapter = compatibility::builtin_adapter(&installation.version);
         let fade_selector = adapter
             .selectors
@@ -5807,8 +6083,23 @@ mod tests {
         let installation = detect().expect("ChatGPT should be installed on the test PC");
         assert_eq!(installation.app_name, "ChatGPT");
         assert!(installation.bundle_id.starts_with("OpenAI.Codex_"));
+        assert!(
+            installation
+                .app_user_model_id
+                .starts_with(&format!("{}!", installation.bundle_id))
+        );
         assert!(installation.executable.ends_with("app\\ChatGPT.exe"));
         assert!(installation.executable.is_file());
+    }
+
+    #[test]
+    #[ignore = "launches an isolated Microsoft Store ChatGPT window"]
+    #[cfg(target_os = "windows")]
+    fn completes_isolated_cdp_smoke_test_on_windows() {
+        let report = run_smoke_test().expect("isolated smoke test should pass");
+        assert!(report.loopback_only);
+        assert!(report.probe_applied);
+        assert!(report.probe_removed);
     }
 
     #[test]
@@ -5853,7 +6144,7 @@ mod tests {
         let websocket_url = {
             let mut session = runtime.session.lock().expect("theme session");
             let session = session.as_mut().expect("active theme session");
-            wait_for_codex_target(session.port, &mut session.instance.child)
+            wait_for_codex_target(session.port, &mut session.instance.process)
                 .expect("Codex page")
                 .web_socket_debugger_url
         };
@@ -5989,7 +6280,7 @@ mod tests {
         let websocket_url = {
             let mut session = runtime.session.lock().expect("theme session");
             let session = session.as_mut().expect("active theme session");
-            wait_for_codex_target(session.port, &mut session.instance.child)
+            wait_for_codex_target(session.port, &mut session.instance.process)
                 .expect("Codex page")
                 .web_socket_debugger_url
         };
@@ -6117,7 +6408,7 @@ mod tests {
         let websocket_url = {
             let mut session = runtime.session.lock().expect("theme session");
             let session = session.as_mut().expect("active theme session");
-            wait_for_codex_target(session.port, &mut session.instance.child)
+            wait_for_codex_target(session.port, &mut session.instance.process)
                 .expect("ChatGPT App page")
                 .web_socket_debugger_url
         };
@@ -6458,7 +6749,7 @@ mod tests {
         let websocket_url = {
             let mut session = runtime.session.lock().expect("theme session");
             let session = session.as_mut().expect("active theme session");
-            wait_for_codex_target(session.port, &mut session.instance.child)
+            wait_for_codex_target(session.port, &mut session.instance.process)
                 .expect("ChatGPT App page")
                 .web_socket_debugger_url
         };
@@ -6564,7 +6855,7 @@ mod tests {
         let websocket_url = {
             let mut session = runtime.session.lock().expect("theme session");
             let session = session.as_mut().expect("active theme session");
-            wait_for_codex_target(session.port, &mut session.instance.child)
+            wait_for_codex_target(session.port, &mut session.instance.process)
                 .expect("ChatGPT App page")
                 .web_socket_debugger_url
         };

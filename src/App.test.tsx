@@ -51,6 +51,7 @@ const desktop = vi.hoisted(() => ({
     trials: [],
   },
   openWebsite: vi.fn(),
+  openGitHubRepository: vi.fn(),
   startOAuthLogin: vi.fn(),
   completeOAuthLogin: vi.fn(),
   syncThemeLocale: vi.fn(),
@@ -73,6 +74,7 @@ vi.mock("./desktop-api", () => ({
     completeOAuthLogin: desktop.completeOAuthLogin,
     logoutAccount: vi.fn(),
     openWebsite: desktop.openWebsite,
+    openGitHubRepository: desktop.openGitHubRepository,
     redeemCdk: vi.fn(),
     registerAccount: vi.fn(),
     requestRegisterCode: vi.fn(),
@@ -108,6 +110,7 @@ describe("ReTheme desktop shell", () => {
       },
     });
     desktop.openWebsite.mockReset().mockResolvedValue(undefined);
+    desktop.openGitHubRepository.mockReset().mockResolvedValue(undefined);
     desktop.startOAuthLogin.mockReset().mockResolvedValue(undefined);
     desktop.completeOAuthLogin.mockReset().mockResolvedValue(desktop.account);
     desktop.getRuntimeEnvironment.mockResolvedValue({
@@ -371,8 +374,11 @@ describe("ReTheme desktop shell", () => {
     desktop.isDesktopRuntime.mockReturnValue(true);
     renderApp();
 
-    expect(await screen.findAllByText("v0.1.0", { selector: "strong" })).toHaveLength(2);
-    expect(screen.getByText("主题引擎", { selector: "small" })).toBeInTheDocument();
+    expect(await screen.findAllByText("v0.1.0", { selector: "strong" })).toHaveLength(1);
+    const support = screen.getByRole("button", { name: "前往 GitHub 为 ReTheme 点 Star" });
+    expect(within(support).getByText("GitHub Star")).toBeInTheDocument();
+    fireEvent.click(support);
+    expect(desktop.openGitHubRepository).toHaveBeenCalledOnce();
     expect(screen.getByText("远程 r12")).toBeInTheDocument();
     expect(screen.getByText("codex-2026-home-v2")).toBeInTheDocument();
     expect(screen.getByText("本地主题通道")).toBeInTheDocument();
