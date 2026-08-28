@@ -20,25 +20,148 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use crate::security_config;
+use crate::{security_config, wallpaper_engine::SceneWallpaperCapture};
 
 const ONLINE_CACHE_MAGIC: &[u8; 4] = b"RTC1";
+const MAX_WALLPAPER_PROJECT_JSON_SIZE: u64 = 1024 * 1024;
+const MAX_LOCAL_WALLPAPER_VIDEO_SIZE: u64 = 16 * 1024 * 1024 * 1024;
+const MAX_WALLPAPER_WEB_FILE_COUNT: usize = 4096;
+const MAX_WALLPAPER_WEB_TOTAL_SIZE: u64 = 512 * 1024 * 1024;
+pub(crate) const WALLPAPER_ASSET_PATH: &str = "wallpaper-engine/background-video";
 
 #[derive(Debug, Clone)]
 pub struct ThemePackage {
     manifest: ThemeManifest,
     css: String,
     runtime_assets: HashMap<String, ThemeRuntimeAsset>,
+    wallpaper_asset: Option<String>,
+    wallpaper_kind: Option<String>,
+    wallpaper_file: Option<String>,
+    wallpaper_scene: Option<Arc<SceneWallpaperCapture>>,
+    wallpaper_controls: Option<WallpaperControls>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ThemeRuntimeAsset {
     pub path: String,
     pub mime: String,
-    pub source: Arc<[u8]>,
+    pub source: ThemeRuntimeAssetSource,
+    pub route_path: Option<String>,
+    pub policy: ThemeAssetPolicy,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ThemeRuntimeAssetSource {
+    Memory(Arc<[u8]>),
+    File(PathBuf),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ThemeAssetPolicy {
+    Media,
+    SandboxedWeb,
+}
+
+impl ThemeRuntimeAsset {
+    pub(crate) fn from_memory(path: String, mime: String, source: Vec<u8>) -> Self {
+        Self {
+            path,
+            mime,
+            source: ThemeRuntimeAssetSource::Memory(Arc::from(source)),
+            route_path: None,
+            policy: ThemeAssetPolicy::Media,
+        }
+    }
+
+    pub(crate) fn from_file(path: String, mime: String, source: PathBuf) -> Self {
+        Self {
+            path,
+            mime,
+            source: ThemeRuntimeAssetSource::File(source),
+            route_path: None,
+            policy: ThemeAssetPolicy::Media,
+        }
+    }
+
+    pub(crate) fn from_web_file(
+        path: String,
+        mime: String,
+        source: PathBuf,
+        route_path: String,
+    ) -> Self {
+        Self {
+            path,
+            mime,
+            source: ThemeRuntimeAssetSource::File(source),
+            route_path: Some(route_path),
+            policy: ThemeAssetPolicy::SandboxedWeb,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WallpaperEngineCatalog {
+    pub root: PathBuf,
+    pub projects: Vec<WallpaperEngineProject>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WallpaperControls {
+    pub wallpaper_brightness: u8,
+    pub interface_transparency: u8,
+}
+
+impl WallpaperControls {
+    pub fn new(wallpaper_brightness: u8, interface_transparency: u8) -> Result<Self, ThemeError> {
+        if wallpaper_brightness > 100 {
+            return Err(ThemeError("壁纸亮度必须在 0 到 100 之间".into()));
+        }
+        if interface_transparency > 100 {
+            return Err(ThemeError("界面透明度必须在 0 到 100 之间".into()));
+        }
+        Ok(Self {
+            wallpaper_brightness,
+            interface_transparency,
+        })
+    }
+}
+
+impl Default for WallpaperControls {
+    fn default() -> Self {
+        Self {
+            wallpaper_brightness: 68,
+            interface_transparency: 32,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WallpaperEngineProject {
+    pub id: String,
+    pub title: String,
+    pub project_type: String,
+    pub project_path: PathBuf,
+    pub media_path: Option<PathBuf>,
+    pub media_size_bytes: Option<u64>,
+    pub requires_wallpaper_engine: bool,
+    pub supported: bool,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WallpaperEngineManifest {
+    #[serde(default)]
+    title: String,
+    #[serde(default, rename = "type")]
+    project_type: String,
+    #[serde(default)]
+    file: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -118,16 +241,47 @@ impl ThemePackage {
         self.runtime_assets.values().cloned().collect()
     }
 
+    pub(crate) fn wallpaper_file_path(&self) -> Option<&Path> {
+        let asset_path = self.wallpaper_file.as_ref()?;
+        match &self.runtime_assets.get(asset_path)?.source {
+            ThemeRuntimeAssetSource::File(path) => Some(path),
+            ThemeRuntimeAssetSource::Memory(_) => None,
+        }
+    }
+
+    pub(crate) fn wallpaper_scene(&self) -> Option<Arc<SceneWallpaperCapture>> {
+        self.wallpaper_scene.clone()
+    }
+
+    pub(crate) fn wallpaper_controls(&self) -> Option<WallpaperControls> {
+        self.wallpaper_controls
+    }
+
     pub(crate) fn runtime_config_with_asset_urls(
         &self,
         asset_urls: &HashMap<String, String>,
     ) -> Result<Value, ThemeError> {
-        build_runtime_config_with(&self.manifest, |path| {
+        let mut config = build_runtime_config_with(&self.manifest, |path| {
             asset_urls
                 .get(path)
                 .cloned()
                 .ok_or_else(|| ThemeError(format!("主题资源 URL 缺失：{path}")))
-        })
+        })?;
+        if let (Some(path), Some(kind)) = (&self.wallpaper_asset, &self.wallpaper_kind) {
+            let asset_url = asset_urls
+                .get(path)
+                .cloned()
+                .ok_or_else(|| ThemeError(format!("动态壁纸资源 URL 缺失：{path}")))?;
+            config["wallpaper"] = json!({
+                "kind": kind,
+                "assetUrl": asset_url,
+                "fit": "cover",
+                "position": "center",
+                "brightness": self.wallpaper_controls.unwrap_or_default().wallpaper_brightness,
+                "interfaceTransparency": self.wallpaper_controls.unwrap_or_default().interface_transparency,
+            });
+        }
+        Ok(config)
     }
 
     pub fn preview_summary(&self) -> ThemeSummary {
@@ -160,6 +314,510 @@ impl ThemePackage {
                 })
                 .collect(),
         }
+    }
+}
+
+pub fn wallpaper_engine_catalog() -> Result<WallpaperEngineCatalog, ThemeError> {
+    scan_wallpaper_engine_root(&default_wallpaper_engine_root())
+}
+
+fn default_wallpaper_engine_root() -> PathBuf {
+    let program_files = std::env::var_os("ProgramFiles(x86)")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files (x86)"));
+    program_files
+        .join("Steam")
+        .join("steamapps")
+        .join("workshop")
+        .join("content")
+        .join("431960")
+}
+
+fn scan_wallpaper_engine_root(root: &Path) -> Result<WallpaperEngineCatalog, ThemeError> {
+    let root = root.canonicalize().map_err(|error| {
+        ThemeError(format!(
+            "找不到 Wallpaper Engine Workshop 目录 {}：{error}",
+            root.display()
+        ))
+    })?;
+    if root.file_name().and_then(|name| name.to_str()) != Some("431960") {
+        return Err(ThemeError(
+            "Wallpaper Engine Workshop 目录必须以 431960 结尾".into(),
+        ));
+    }
+    let entries = fs::read_dir(&root)
+        .map_err(|error| ThemeError(format!("无法读取 {}：{error}", root.display())))?;
+    let mut projects = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let project_path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        let id = entry.file_name().to_string_lossy().into_owned();
+        if !id.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let manifest = match read_wallpaper_engine_manifest(&project_path) {
+            Ok(manifest) => manifest,
+            Err(_) => continue,
+        };
+        projects.push(describe_wallpaper_engine_project(
+            &project_path,
+            id,
+            manifest,
+        ));
+    }
+    projects.sort_by(|left, right| {
+        left.title
+            .to_lowercase()
+            .cmp(&right.title.to_lowercase())
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(WallpaperEngineCatalog { root, projects })
+}
+
+fn read_wallpaper_engine_manifest(
+    project_path: &Path,
+) -> Result<WallpaperEngineManifest, ThemeError> {
+    let manifest_path = project_path.join("project.json");
+    let metadata = fs::metadata(&manifest_path)
+        .map_err(|error| ThemeError(format!("无法读取 {}：{error}", manifest_path.display())))?;
+    if metadata.len() > MAX_WALLPAPER_PROJECT_JSON_SIZE {
+        return Err(ThemeError(format!(
+            "{} 超过 1 MiB，拒绝解析",
+            manifest_path.display()
+        )));
+    }
+    let source = fs::read(&manifest_path)
+        .map_err(|error| ThemeError(format!("无法读取 {}：{error}", manifest_path.display())))?;
+    serde_json::from_slice(&source)
+        .map_err(|error| ThemeError(format!("{} 无效：{error}", manifest_path.display())))
+}
+
+fn describe_wallpaper_engine_project(
+    project_path: &Path,
+    id: String,
+    manifest: WallpaperEngineManifest,
+) -> WallpaperEngineProject {
+    let project_type = manifest.project_type.to_ascii_lowercase();
+    let requires_wallpaper_engine = project_type == "scene";
+    let title = if manifest.title.trim().is_empty() {
+        id.clone()
+    } else {
+        manifest.title.trim().to_owned()
+    };
+    if !matches!(project_type.as_str(), "video" | "scene" | "web") {
+        return WallpaperEngineProject {
+            id,
+            title,
+            project_type: project_type.clone(),
+            project_path: project_path.to_path_buf(),
+            media_path: None,
+            media_size_bytes: None,
+            requires_wallpaper_engine,
+            supported: false,
+            reason: Some("不支持的 Wallpaper Engine 项目类型".into()),
+        };
+    }
+
+    let declared_file = if project_type == "scene" {
+        "scene.pkg"
+    } else {
+        manifest.file.as_str()
+    };
+    let media_path = match safe_project_file(project_path, declared_file) {
+        Ok(path) => path,
+        Err(error) => {
+            return WallpaperEngineProject {
+                id,
+                title,
+                project_type,
+                project_path: project_path.to_path_buf(),
+                media_path: None,
+                media_size_bytes: None,
+                requires_wallpaper_engine,
+                supported: false,
+                reason: Some(error.to_string()),
+            };
+        }
+    };
+    let extension = media_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let expected_extension = match project_type.as_str() {
+        "video" => matches!(extension.as_str(), "mp4" | "m4v" | "webm"),
+        "web" => matches!(extension.as_str(), "html" | "htm"),
+        "scene" => extension == "pkg",
+        _ => false,
+    };
+    if !expected_extension {
+        return WallpaperEngineProject {
+            id,
+            title,
+            project_type: project_type.clone(),
+            project_path: project_path.to_path_buf(),
+            media_path: Some(media_path),
+            media_size_bytes: None,
+            requires_wallpaper_engine,
+            supported: false,
+            reason: Some(format!(
+                "{project_type} 项目的主文件格式不受支持：.{extension}"
+            )),
+        };
+    }
+    let media_size_bytes = fs::metadata(&media_path)
+        .ok()
+        .map(|metadata| metadata.len());
+    let reason = match media_size_bytes {
+        None => Some("无法读取壁纸资源大小".into()),
+        Some(0) => Some("壁纸资源为空".into()),
+        Some(size) if project_type == "video" && size > MAX_LOCAL_WALLPAPER_VIDEO_SIZE => {
+            Some("视频超过本地动态壁纸 16 GiB 安全上限".into())
+        }
+        Some(_) => None,
+    };
+    WallpaperEngineProject {
+        id,
+        title,
+        project_type,
+        project_path: project_path.to_path_buf(),
+        media_path: Some(media_path),
+        media_size_bytes,
+        requires_wallpaper_engine,
+        supported: reason.is_none(),
+        reason,
+    }
+}
+
+fn safe_project_file(project_path: &Path, relative: &str) -> Result<PathBuf, ThemeError> {
+    if relative.trim().is_empty() {
+        return Err(ThemeError("project.json 未声明主文件".into()));
+    }
+    let relative_path = Path::new(relative);
+    if relative_path.is_absolute()
+        || relative_path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+    {
+        return Err(ThemeError("project.json 的主文件路径不安全".into()));
+    }
+    let root = project_path
+        .canonicalize()
+        .map_err(|error| ThemeError(format!("无法解析项目目录：{error}")))?;
+    let candidate = root.join(relative_path).canonicalize().map_err(|error| {
+        ThemeError(format!(
+            "找不到 Wallpaper Engine 主文件 {relative}：{error}"
+        ))
+    })?;
+    if !candidate.starts_with(&root) || !candidate.is_file() {
+        return Err(ThemeError(
+            "Wallpaper Engine 主文件不在所选项目目录内".into(),
+        ));
+    }
+    Ok(candidate)
+}
+
+pub fn load_wallpaper_engine_project(
+    project_path: &Path,
+    controls: WallpaperControls,
+) -> Result<ThemePackage, ThemeError> {
+    load_wallpaper_engine_project_from_root(
+        &default_wallpaper_engine_root(),
+        project_path,
+        controls,
+    )
+}
+
+fn load_wallpaper_engine_project_from_root(
+    workshop_root: &Path,
+    project_path: &Path,
+    controls: WallpaperControls,
+) -> Result<ThemePackage, ThemeError> {
+    let controls = WallpaperControls::new(
+        controls.wallpaper_brightness,
+        controls.interface_transparency,
+    )?;
+    let workshop_root = workshop_root
+        .canonicalize()
+        .map_err(|error| ThemeError(format!("无法解析 Wallpaper Engine Workshop 目录：{error}")))?;
+    let project_path = project_path
+        .canonicalize()
+        .map_err(|error| ThemeError(format!("无法解析 Wallpaper Engine 项目目录：{error}")))?;
+    let id = project_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+        .ok_or_else(|| ThemeError("所选目录不是有效的 Wallpaper Engine Workshop 项目".into()))?;
+    if project_path.parent() != Some(workshop_root.as_path()) {
+        return Err(ThemeError(
+            "只允许导入已扫描的 Wallpaper Engine Workshop 项目目录".into(),
+        ));
+    }
+    let manifest = read_wallpaper_engine_manifest(&project_path)?;
+    let project = describe_wallpaper_engine_project(&project_path, id.to_owned(), manifest);
+    if !project.supported {
+        return Err(ThemeError(
+            project
+                .reason
+                .unwrap_or_else(|| "当前 Wallpaper Engine 项目不受支持".into()),
+        ));
+    }
+    let media_path = project
+        .media_path
+        .clone()
+        .ok_or_else(|| ThemeError("Wallpaper Engine 主文件路径缺失".into()))?;
+    let extension = media_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let playback_description = match project.project_type.as_str() {
+        "video" => "本地视频流式播放，不复制 Workshop 原文件",
+        "web" => "本地 Web 壁纸沙箱运行，已禁止联网和外部跳转",
+        "scene" => "Wallpaper Engine 官方引擎原版渲染，高清离屏传输到 ChatGPT",
+        _ => unreachable!("unsupported project types were rejected above"),
+    };
+    let theme_id = format!("local.wallpaper-engine.w{id}");
+    let display_title = project.title.chars().take(80).collect::<String>();
+    let manifest = json!({
+        "schemaVersion": 1,
+        "id": theme_id,
+        "name": display_title,
+        "description": format!("Wallpaper Engine 本地动态壁纸 · Workshop {id}"),
+        "version": "1.0.0",
+        "author": { "id": "local.wallpaper-engine", "name": "Wallpaper Engine" },
+        "testedCodexVersions": [],
+        "styles": ["styles/wallpaper.css"],
+        "slots": [
+            "app.shell", "app.background", "titlebar", "sidebar", "main", "page",
+            "home.hero", "home.hero.media", "home.hero.media.asset", "home.card",
+            "conversation.banner", "composer", "settings.canvas", "settings.card"
+        ],
+        "permissions": [],
+        "preview": { "background": "#080b12", "surface": "#161b26", "accent": "#7aa2ff" },
+        "experience": {
+            "homeHero": {
+                "eyebrow": "WALLPAPER ENGINE",
+                "title": display_title,
+                "description": playback_description,
+                "asset": "assets/transparent.svg",
+                "fit": "cover",
+                "position": "center"
+            },
+            "homePrompt": { "title": "今天想聊些什么？" },
+            "assets": [],
+            "decorations": []
+        },
+        "locales": {}
+    });
+    let wallpaper_brightness = f32::from(controls.wallpaper_brightness) / 100.0;
+    let interface_opacity = f32::from(100 - controls.interface_transparency) / 100.0;
+    let css = format!(
+        r#":root[data-ct-theme="{theme_id}"] {{ --ct-wallpaper-brightness: {wallpaper_brightness:.2}; --ct-interface-opacity: {interface_opacity:.2}; }}
+:root[data-ct-theme="{theme_id}"] [data-ct-slot="app.shell"] {{ background: transparent !important; color: #f4f7ff; }}
+:root[data-ct-theme="{theme_id}"] [data-ct-mount="app.background"] > :where(img, video, iframe, canvas) {{ display: block !important; width: 100% !important; height: 100% !important; border: 0 !important; object-fit: cover !important; object-position: center !important; opacity: 1 !important; filter: brightness(var(--ct-wallpaper-brightness)) saturate(0.9); }}
+:root[data-ct-theme="{theme_id}"] [data-ct-mount="home.hero"] {{ display: none !important; }}
+:root[data-ct-theme="{theme_id}"] :where([data-ct-slot="main"], [data-ct-slot="page"], [data-ct-slot="settings.canvas"]) {{ background: rgb(7 10 17 / calc(var(--ct-interface-opacity) * 0.66)) !important; }}
+:root[data-ct-theme="{theme_id}"][data-ct-view="conversation"] :where([data-ct-slot="main"], [data-ct-slot="page"], [data-ct-slot="main.content.frame"]) {{ background: transparent !important; background-image: none !important; border-color: transparent !important; box-shadow: none !important; }}
+:root[data-ct-theme="{theme_id}"] [data-ct-slot="sidebar"] {{ background: rgb(8 11 18 / var(--ct-interface-opacity)) !important; }}
+:root[data-ct-theme="{theme_id}"] :where([data-ct-slot="home.card"], [data-ct-slot="composer"], [data-ct-slot="settings.card"], [data-ct-slot="conversation.banner"]) {{ background: rgb(16 21 31 / calc(var(--ct-interface-opacity) * 0.94)) !important; border-color: rgb(255 255 255 / calc(var(--ct-interface-opacity) * 0.22)) !important; }}
+:root[data-ct-theme="{theme_id}"] :where([data-ct-slot="home.card"], [data-ct-slot="settings.card"], [data-ct-slot="conversation.banner"]) {{ box-shadow: 0 14px 36px rgb(0 0 0 / calc(var(--ct-interface-opacity) * 0.34)) !important; }}
+:root[data-ct-theme="{theme_id}"] [data-ct-slot="composer"] {{ box-shadow: none !important; }}
+:root[data-ct-theme="{theme_id}"] .ct-wallpaper-controls {{ position: fixed !important; right: 20px !important; bottom: 104px !important; z-index: 2147483000 !important; width: 236px !important; color: #f7f8fc !important; font-size: 13px !important; line-height: 1.35 !important; pointer-events: auto !important; }}
+:root[data-ct-theme="{theme_id}"] .ct-wallpaper-controls * {{ box-sizing: border-box !important; }}
+:root[data-ct-theme="{theme_id}"] .ct-wallpaper-controls__panel {{ display: grid !important; gap: 11px !important; padding: 13px 14px !important; border: 1px solid rgb(255 255 255 / 16%) !important; border-radius: 14px !important; background: rgb(12 16 24 / 82%) !important; box-shadow: 0 14px 38px rgb(0 0 0 / 34%) !important; backdrop-filter: blur(18px) !important; -webkit-backdrop-filter: blur(18px) !important; }}
+:root[data-ct-theme="{theme_id}"] .ct-wallpaper-controls__header {{ display: flex !important; align-items: center !important; justify-content: space-between !important; gap: 8px !important; }}
+:root[data-ct-theme="{theme_id}"] .ct-wallpaper-controls__header strong {{ font-size: 13px !important; letter-spacing: .02em !important; }}
+:root[data-ct-theme="{theme_id}"] .ct-wallpaper-controls__collapse {{ width: 26px !important; height: 26px !important; padding: 0 !important; border: 0 !important; border-radius: 8px !important; color: #f7f8fc !important; background: rgb(255 255 255 / 9%) !important; cursor: pointer !important; }}
+:root[data-ct-theme="{theme_id}"] .ct-wallpaper-controls__field {{ display: grid !important; gap: 5px !important; }}
+:root[data-ct-theme="{theme_id}"] .ct-wallpaper-controls__label {{ display: flex !important; justify-content: space-between !important; gap: 8px !important; color: rgb(247 248 252 / 86%) !important; }}
+:root[data-ct-theme="{theme_id}"] .ct-wallpaper-controls__label output {{ color: #ffb340 !important; font-weight: 700 !important; }}
+:root[data-ct-theme="{theme_id}"] .ct-wallpaper-controls__range {{ width: 100% !important; height: 18px !important; margin: 0 !important; padding: 0 !important; accent-color: #f2a93b !important; cursor: pointer !important; }}
+:root[data-ct-theme="{theme_id}"] .ct-wallpaper-controls__playback {{ display: flex !important; align-items: center !important; justify-content: center !important; gap: 7px !important; width: 100% !important; min-height: 34px !important; padding: 7px 12px !important; border: 1px solid rgb(255 179 64 / 46%) !important; border-radius: 9px !important; color: #ffd28c !important; background: rgb(242 169 59 / 14%) !important; font-weight: 700 !important; cursor: pointer !important; transition: background-color 120ms ease, border-color 120ms ease !important; }}
+:root[data-ct-theme="{theme_id}"] .ct-wallpaper-controls__playback:hover {{ border-color: rgb(255 179 64 / 72%) !important; background: rgb(242 169 59 / 24%) !important; }}
+:root[data-ct-theme="{theme_id}"] .ct-wallpaper-controls__playback:focus-visible {{ outline: 2px solid #ffb340 !important; outline-offset: 2px !important; }}
+:root[data-ct-theme="{theme_id}"] .ct-wallpaper-controls__playback-icon {{ display: inline-flex !important; align-items: center !important; justify-content: center !important; width: 16px !important; color: #ffb340 !important; font-size: 12px !important; line-height: 1 !important; }}
+:root[data-ct-theme="{theme_id}"] .ct-wallpaper-controls__open {{ display: none !important; width: 48px !important; height: 48px !important; margin-left: auto !important; padding: 0 !important; border: 1px solid rgb(255 255 255 / 18%) !important; border-radius: 14px !important; color: #11151d !important; background: #f2a93b !important; box-shadow: 0 10px 28px rgb(0 0 0 / 30%) !important; font-weight: 800 !important; cursor: pointer !important; }}
+:root[data-ct-theme="{theme_id}"] .ct-wallpaper-controls.ct-wallpaper-controls--collapsed {{ width: 48px !important; }}
+:root[data-ct-theme="{theme_id}"] .ct-wallpaper-controls.ct-wallpaper-controls--collapsed .ct-wallpaper-controls__panel {{ display: none !important; }}
+:root[data-ct-theme="{theme_id}"] .ct-wallpaper-controls.ct-wallpaper-controls--collapsed .ct-wallpaper-controls__open {{ display: block !important; }}
+@media (max-width: 900px), (max-height: 700px) {{ :root[data-ct-theme="{theme_id}"] .ct-wallpaper-controls {{ right: 12px !important; bottom: 84px !important; }} }}"#
+    );
+    let transparent_svg = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"></svg>"#;
+    let files = HashMap::from([
+        (
+            "manifest.json".to_owned(),
+            serde_json::to_vec_pretty(&manifest)
+                .map_err(|error| ThemeError(format!("无法创建动态壁纸主题：{error}")))?,
+        ),
+        ("styles/wallpaper.css".to_owned(), css.into_bytes()),
+        (
+            "assets/transparent.svg".to_owned(),
+            transparent_svg.to_vec(),
+        ),
+    ]);
+    let mut package = parse_package_files(&files, false)?;
+    match project.project_type.as_str() {
+        "video" => {
+            let mime = if extension == "webm" {
+                "video/webm"
+            } else {
+                "video/mp4"
+            };
+            package.runtime_assets.insert(
+                WALLPAPER_ASSET_PATH.into(),
+                ThemeRuntimeAsset::from_file(WALLPAPER_ASSET_PATH.into(), mime.into(), media_path),
+            );
+            package.wallpaper_file = Some(WALLPAPER_ASSET_PATH.into());
+        }
+        "web" => {
+            for asset in collect_wallpaper_web_assets(&project_path, &media_path)? {
+                package.runtime_assets.insert(asset.path.clone(), asset);
+            }
+        }
+        "scene" => {
+            let scene =
+                SceneWallpaperCapture::start(&workshop_root, &project_path.join("project.json"))
+                    .map_err(ThemeError)?;
+            package.runtime_assets.insert(
+                WALLPAPER_ASSET_PATH.into(),
+                ThemeRuntimeAsset::from_memory(
+                    WALLPAPER_ASSET_PATH.into(),
+                    "image/jpeg".into(),
+                    Vec::new(),
+                ),
+            );
+            package.wallpaper_scene = Some(Arc::new(scene));
+        }
+        _ => unreachable!("unsupported project types were rejected above"),
+    }
+    package.wallpaper_asset = Some(WALLPAPER_ASSET_PATH.into());
+    package.wallpaper_kind = Some(project.project_type);
+    package.wallpaper_controls = Some(controls);
+    Ok(package)
+}
+
+fn collect_wallpaper_web_assets(
+    project_root: &Path,
+    entry_path: &Path,
+) -> Result<Vec<ThemeRuntimeAsset>, ThemeError> {
+    let project_root = project_root
+        .canonicalize()
+        .map_err(|error| ThemeError(format!("无法解析 Web 壁纸目录：{error}")))?;
+    let entry_path = entry_path
+        .canonicalize()
+        .map_err(|error| ThemeError(format!("无法解析 Web 壁纸入口：{error}")))?;
+    let mut pending = vec![project_root.clone()];
+    let mut files = Vec::new();
+    let mut total_size = 0_u64;
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory)
+            .map_err(|error| ThemeError(format!("无法读取 Web 壁纸目录：{error}")))?
+        {
+            let entry =
+                entry.map_err(|error| ThemeError(format!("无法读取 Web 壁纸文件：{error}")))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|error| ThemeError(format!("无法检查 Web 壁纸文件：{error}")))?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                pending.push(entry.path());
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let path = entry
+                .path()
+                .canonicalize()
+                .map_err(|error| ThemeError(format!("无法解析 Web 壁纸文件：{error}")))?;
+            if !path.starts_with(&project_root) {
+                return Err(ThemeError("Web 壁纸文件越出了项目目录".into()));
+            }
+            let size = fs::metadata(&path)
+                .map_err(|error| ThemeError(format!("无法读取 Web 壁纸文件大小：{error}")))?
+                .len();
+            total_size = total_size
+                .checked_add(size)
+                .ok_or_else(|| ThemeError("Web 壁纸总大小溢出".into()))?;
+            if total_size > MAX_WALLPAPER_WEB_TOTAL_SIZE {
+                return Err(ThemeError("Web 壁纸超过 512 MiB 安全上限".into()));
+            }
+            files.push(path);
+            if files.len() > MAX_WALLPAPER_WEB_FILE_COUNT {
+                return Err(ThemeError("Web 壁纸文件数量超过 4096 个安全上限".into()));
+            }
+        }
+    }
+    let mut assets = Vec::with_capacity(files.len());
+    for path in files {
+        let relative = path
+            .strip_prefix(&project_root)
+            .map_err(|_| ThemeError("Web 壁纸文件越出了项目目录".into()))?;
+        let route_relative = relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        let logical_path = if path == entry_path {
+            WALLPAPER_ASSET_PATH.to_owned()
+        } else {
+            format!("wallpaper-engine/web/{route_relative}")
+        };
+        assets.push(ThemeRuntimeAsset::from_web_file(
+            logical_path,
+            wallpaper_web_mime(&path).into(),
+            path,
+            format!("web/{route_relative}"),
+        ));
+    }
+    if !assets
+        .iter()
+        .any(|asset| asset.path == WALLPAPER_ASSET_PATH)
+    {
+        return Err(ThemeError("Web 壁纸入口文件不在项目目录中".into()));
+    }
+    Ok(assets)
+}
+
+fn wallpaper_web_mime(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" => "application/json",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "mp3" => "audio/mpeg",
+        "ogg" => "audio/ogg",
+        "wav" => "audio/wav",
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        _ => "application/octet-stream",
     }
 }
 
@@ -545,6 +1203,11 @@ fn parse_package_files(
         manifest,
         css: validated.css,
         runtime_assets,
+        wallpaper_asset: None,
+        wallpaper_kind: None,
+        wallpaper_file: None,
+        wallpaper_scene: None,
+        wallpaper_controls: None,
     })
 }
 
@@ -708,11 +1371,7 @@ fn collect_runtime_assets(
             let mime = validate_image(path, source)?.to_owned();
             Ok((
                 path.to_owned(),
-                ThemeRuntimeAsset {
-                    path: path.to_owned(),
-                    mime,
-                    source: Arc::from(source.clone()),
-                },
+                ThemeRuntimeAsset::from_memory(path.to_owned(), mime, source.clone()),
             ))
         })
         .collect()
@@ -822,6 +1481,200 @@ mod tests {
     use zip::write::SimpleFileOptions;
 
     const TEST_SECRET: [u8; 32] = [7; 32];
+
+    #[test]
+    fn scans_and_loads_wallpaper_engine_video_without_copying_it() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().join("431960");
+        let project_path = root.join("1234567890");
+        fs::create_dir_all(&project_path).expect("workshop project directory");
+        fs::write(
+            project_path.join("project.json"),
+            br#"{"title":"Test video","type":"video","file":"wallpaper.mp4"}"#,
+        )
+        .expect("project manifest");
+        fs::write(project_path.join("wallpaper.mp4"), b"video-bytes").expect("test video");
+
+        let catalog = scan_wallpaper_engine_root(&root).expect("wallpaper catalog");
+        assert_eq!(catalog.projects.len(), 1);
+        assert!(catalog.projects[0].supported);
+        assert_eq!(catalog.projects[0].media_size_bytes, Some(11));
+
+        let controls = WallpaperControls::new(42, 73).expect("wallpaper controls");
+        let package = load_wallpaper_engine_project_from_root(&root, &project_path, controls)
+            .expect("video package");
+        let assets = package.runtime_assets();
+        let video = assets
+            .iter()
+            .find(|asset| asset.path == WALLPAPER_ASSET_PATH)
+            .expect("streamed video asset");
+        assert!(matches!(&video.source, ThemeRuntimeAssetSource::File(_)));
+        let urls = assets
+            .iter()
+            .map(|asset| {
+                (
+                    asset.path.clone(),
+                    format!("http://127.0.0.1/{}", asset.path),
+                )
+            })
+            .collect();
+        let config = package
+            .runtime_config_with_asset_urls(&urls)
+            .expect("runtime config");
+        assert_eq!(config["wallpaper"]["kind"], "video");
+        assert_eq!(
+            config["wallpaper"]["assetUrl"].as_str(),
+            Some(urls[WALLPAPER_ASSET_PATH].as_str())
+        );
+        assert_eq!(config["wallpaper"]["brightness"], 42);
+        assert_eq!(config["wallpaper"]["interfaceTransparency"], 73);
+        assert!(package.css.contains("--ct-wallpaper-brightness: 0.42"));
+        assert!(package.css.contains("--ct-interface-opacity: 0.27"));
+        assert!(package.css.contains("[data-ct-mount=\"home.hero\"]"));
+        assert!(package.css.contains("display: none !important"));
+        assert!(package.css.contains(".ct-wallpaper-controls"));
+        assert!(
+            package
+                .css
+                .contains("[data-ct-view=\"conversation\"] :where([data-ct-slot=\"main\"]")
+        );
+        assert!(package.css.contains("background: transparent !important"));
+        assert!(
+            package
+                .css
+                .contains("[data-ct-slot=\"composer\"] { box-shadow: none !important; }")
+        );
+    }
+
+    #[test]
+    fn rejects_wallpaper_controls_above_one_hundred() {
+        let error = WallpaperControls::new(101, 32).expect_err("brightness above 100 must fail");
+        assert!(error.to_string().contains("0 到 100"));
+        let error = WallpaperControls::new(68, 101)
+            .expect_err("interface transparency above 100 must fail");
+        assert!(error.to_string().contains("0 到 100"));
+    }
+
+    #[test]
+    fn scans_scene_and_loads_sandboxed_web_projects() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().join("431960");
+        for (id, project_type, file) in
+            [("100", "scene", "scene.json"), ("200", "web", "index.html")]
+        {
+            let project_path = root.join(id);
+            fs::create_dir_all(&project_path).expect("workshop project directory");
+            fs::write(
+                project_path.join("project.json"),
+                serde_json::to_vec(&json!({
+                    "title": id,
+                    "type": project_type,
+                    "file": file,
+                    "preview": if project_type == "scene" { "preview.gif" } else { "" },
+                }))
+                .expect("project manifest JSON"),
+            )
+            .expect("project manifest");
+        }
+        fs::write(root.join("100").join("scene.pkg"), b"scene-package").expect("scene package");
+        fs::write(
+            root.join("200").join("index.html"),
+            br#"<html><script src="js/app.js"></script></html>"#,
+        )
+        .expect("web entry");
+        fs::create_dir_all(root.join("200").join("js")).expect("web script directory");
+        fs::write(
+            root.join("200").join("js").join("app.js"),
+            b"window.ready=true",
+        )
+        .expect("web script");
+
+        let catalog = scan_wallpaper_engine_root(&root).expect("wallpaper catalog");
+        assert_eq!(catalog.projects.len(), 2);
+        assert!(catalog.projects.iter().all(|project| project.supported));
+        let scene = catalog
+            .projects
+            .iter()
+            .find(|project| project.project_type == "scene")
+            .expect("scene project");
+        assert!(scene.requires_wallpaper_engine);
+        assert_eq!(
+            scene.media_path.as_deref(),
+            Some(
+                root.join("100")
+                    .join("scene.pkg")
+                    .canonicalize()
+                    .unwrap()
+                    .as_path()
+            )
+        );
+        let web = catalog
+            .projects
+            .iter()
+            .find(|project| project.project_type == "web")
+            .expect("web project");
+        assert!(!web.requires_wallpaper_engine);
+
+        let package = load_wallpaper_engine_project_from_root(
+            &root,
+            &root.join("200"),
+            WallpaperControls::default(),
+        )
+        .expect("sandboxed web package");
+        let assets = package.runtime_assets();
+        assert_eq!(
+            assets
+                .iter()
+                .filter(|asset| asset.policy == ThemeAssetPolicy::SandboxedWeb)
+                .count(),
+            3
+        );
+        let entry = assets
+            .iter()
+            .find(|asset| asset.path == WALLPAPER_ASSET_PATH)
+            .expect("web entry asset");
+        assert_eq!(entry.route_path.as_deref(), Some("web/index.html"));
+        assert_eq!(entry.policy, ThemeAssetPolicy::SandboxedWeb);
+        let urls = assets
+            .iter()
+            .map(|asset| {
+                (
+                    asset.path.clone(),
+                    format!("http://127.0.0.1/{}", asset.path),
+                )
+            })
+            .collect();
+        let config = package
+            .runtime_config_with_asset_urls(&urls)
+            .expect("web runtime config");
+        assert_eq!(config["wallpaper"]["kind"], "web");
+    }
+
+    #[test]
+    fn classifies_static_scene_previews_as_original_engine_scenes() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().join("431960");
+        let project_path = root.join("300");
+        fs::create_dir_all(&project_path).expect("workshop project directory");
+        fs::write(
+            project_path.join("project.json"),
+            br#"{"title":"Static scene","type":"scene","file":"scene.json","preview":"preview.jpg"}"#,
+        )
+        .expect("project manifest");
+        fs::write(project_path.join("scene.pkg"), b"scene-package").expect("scene package");
+        fs::write(project_path.join("preview.jpg"), b"jpeg-preview").expect("scene preview");
+
+        let catalog = scan_wallpaper_engine_root(&root).expect("wallpaper catalog");
+        let project = catalog.projects.first().expect("scene project");
+        assert!(project.supported);
+        assert!(project.requires_wallpaper_engine);
+        assert!(
+            project
+                .media_path
+                .as_ref()
+                .is_some_and(|path| path.ends_with("scene.pkg"))
+        );
+    }
 
     #[test]
     fn codex_tested_versions_are_optional_and_accept_legacy_field() {

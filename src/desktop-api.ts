@@ -16,6 +16,8 @@ import type {
   ThemeSummary,
   AccountStatus,
   AccountSync,
+  WallpaperEngineCatalog,
+  WallpaperControls,
 } from "./types";
 import { translate } from "./i18n";
 
@@ -57,6 +59,26 @@ export async function chooseAndPreviewLocalTheme(locale: string): Promise<ThemeP
   return invoke<ThemePreviewReport>("start_local_theme_preview", { themePath, locale });
 }
 
+export async function getWallpaperEngineCatalog(): Promise<WallpaperEngineCatalog> {
+  if (!isDesktopRuntime()) return { root: "", projects: [] };
+  return invoke<WallpaperEngineCatalog>("wallpaper_engine_catalog");
+}
+
+export async function previewWallpaperEngineProject(projectPath: string, locale: string, controls: WallpaperControls): Promise<ThemePreviewReport> {
+  if (!isDesktopRuntime()) throw new Error("浏览器预览不能加载 Wallpaper Engine 壁纸");
+  return invoke<ThemePreviewReport>("start_wallpaper_engine_preview", { projectPath, locale, ...controls });
+}
+
+export async function getWallpaperControlPreferences(): Promise<WallpaperControls | null> {
+  if (!isDesktopRuntime()) return null;
+  return invoke<WallpaperControls | null>("wallpaper_control_preferences");
+}
+
+export async function updateWallpaperControls(controls: WallpaperControls): Promise<WallpaperControls> {
+  if (!isDesktopRuntime()) return controls;
+  return invoke<WallpaperControls>("update_wallpaper_controls", controls);
+}
+
 export async function restoreOfficialTheme(): Promise<boolean> {
   if (!isDesktopRuntime()) return true;
   return invoke<boolean>("stop_theme_preview");
@@ -79,21 +101,26 @@ export type DesktopUpdate = {
   install: () => Promise<void>;
 };
 
-export async function checkForUpdate(): Promise<DesktopUpdate | null> {
+type GithubUpdateInfo = Omit<DesktopUpdate, "install">;
+
+export async function checkForUpdate(repository: string): Promise<DesktopUpdate | null> {
   if (!isDesktopRuntime()) return null;
-  const { check } = await import("@tauri-apps/plugin-updater");
-  const update = await check();
-  if (!update) return null;
+  const info = await invoke<GithubUpdateInfo | null>("check_github_update", { repository });
+  if (!info) return null;
   return {
-    currentVersion: update.currentVersion,
-    version: update.version,
-    body: update.body,
+    ...info,
     install: async () => {
-      await update.downloadAndInstall();
+      const installed = await invoke<boolean>("install_github_update", { repository });
+      if (!installed) throw new Error("更新版本已发生变化，请重新检查");
       const { relaunch } = await import("@tauri-apps/plugin-process");
       await relaunch();
     },
   };
+}
+
+export async function releaseUiMemory(): Promise<void> {
+  if (!isDesktopRuntime()) return;
+  await invoke("release_ui_memory");
 }
 
 export async function syncTrayLocale(locale: string): Promise<void> {

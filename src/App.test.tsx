@@ -12,14 +12,19 @@ const desktop = vi.hoisted(() => ({
   applyTheme: vi.fn(),
   chooseAndPreviewLocalTheme: vi.fn(),
   checkForUpdate: vi.fn(),
+  releaseUiMemory: vi.fn(),
   getRuntimeEnvironment: vi.fn(),
   getAccountStatus: vi.fn(),
   getAccountSync: vi.fn(),
   getThemePreviewStatus: vi.fn(),
+  getWallpaperControlPreferences: vi.fn(),
+  getWallpaperEngineCatalog: vi.fn(),
   isDesktopRuntime: vi.fn(),
   listThemes: vi.fn(),
   downloadOnlineTheme: vi.fn(),
   restoreOfficialTheme: vi.fn(),
+  previewWallpaperEngineProject: vi.fn(),
+  updateWallpaperControls: vi.fn(),
   uninstallTheme: vi.fn(),
   installation: {
     appName: "ChatGPT",
@@ -60,6 +65,7 @@ const desktop = vi.hoisted(() => ({
 vi.mock("./desktop-api", () => ({
     applyTheme: desktop.applyTheme,
     checkForUpdate: desktop.checkForUpdate,
+    releaseUiMemory: desktop.releaseUiMemory,
     chooseAndPreviewLocalTheme: desktop.chooseAndPreviewLocalTheme,
     detectCodex: vi.fn().mockResolvedValue(desktop.installation),
     downloadOnlineTheme: desktop.downloadOnlineTheme,
@@ -67,6 +73,8 @@ vi.mock("./desktop-api", () => ({
     getAccountSync: desktop.getAccountSync,
     getRuntimeEnvironment: desktop.getRuntimeEnvironment,
     getThemePreviewStatus: desktop.getThemePreviewStatus,
+    getWallpaperControlPreferences: desktop.getWallpaperControlPreferences,
+    getWallpaperEngineCatalog: desktop.getWallpaperEngineCatalog,
     isDesktopRuntime: desktop.isDesktopRuntime,
     listThemes: desktop.listThemes,
     loginAccount: vi.fn(),
@@ -79,6 +87,8 @@ vi.mock("./desktop-api", () => ({
     registerAccount: vi.fn(),
     requestRegisterCode: vi.fn(),
     restoreOfficialTheme: desktop.restoreOfficialTheme,
+    previewWallpaperEngineProject: desktop.previewWallpaperEngineProject,
+    updateWallpaperControls: desktop.updateWallpaperControls,
     runSmokeTest: vi.fn(),
     syncThemeLocale: desktop.syncThemeLocale,
     syncTrayLocale: vi.fn(),
@@ -93,9 +103,17 @@ vi.mock("@tauri-apps/plugin-deep-link", () => ({
 describe("ReTheme desktop shell", () => {
   beforeEach(() => {
     window.localStorage.setItem("retheme.locale", "zh-CN");
+    window.localStorage.setItem("retheme.update-repository.v1", "example/retheme-we");
+    window.localStorage.setItem("retheme.preferences.v1", JSON.stringify({ launchAtLogin: false, hideToTray: true, autoUpdate: true, autoDetectCodex: true, lowMemoryMode: true }));
+    window.localStorage.removeItem("retheme.wallpaper-preferences.v1");
     desktop.isDesktopRuntime.mockReturnValue(false);
     desktop.checkForUpdate.mockReset().mockResolvedValue(null);
+    desktop.releaseUiMemory.mockReset().mockResolvedValue(undefined);
     desktop.getThemePreviewStatus.mockReset().mockResolvedValue(null);
+    desktop.getWallpaperControlPreferences.mockReset().mockResolvedValue(null);
+    desktop.getWallpaperEngineCatalog.mockReset().mockResolvedValue({ root: "C:\\Workshop\\431960", projects: [] });
+    desktop.previewWallpaperEngineProject.mockReset();
+    desktop.updateWallpaperControls.mockReset().mockImplementation(async (controls) => controls);
     desktop.listThemes.mockReset().mockResolvedValue(desktop.themes);
     desktop.downloadOnlineTheme.mockReset();
     desktop.getAccountStatus.mockReset().mockResolvedValue(desktop.account);
@@ -147,12 +165,14 @@ describe("ReTheme desktop shell", () => {
   });
 
   test("applies and restores an installed theme", async () => {
+    desktop.isDesktopRuntime.mockReturnValue(true);
     renderApp();
     fireEvent.click(screen.getByRole("button", { name: "主题库" }));
     const apply = await screen.findByRole("button", { name: "应用主题 Protocol Preview" });
     await waitFor(() => expect(apply).toBeEnabled());
     fireEvent.click(apply);
     await waitFor(() => expect(desktop.applyTheme).toHaveBeenCalledWith("studio.example.protocol-preview", "zh-CN"));
+    await waitFor(() => expect(desktop.releaseUiMemory).toHaveBeenCalledOnce());
     const restore = await screen.findByRole("button", { name: "恢复 Protocol Preview 主题" });
     fireEvent.click(restore);
     await waitFor(() => expect(desktop.restoreOfficialTheme).toHaveBeenCalledOnce());
@@ -206,6 +226,109 @@ describe("ReTheme desktop shell", () => {
 
     expect(await screen.findByText("本地预览 · 本地调试主题")).toBeInTheDocument();
     expect(desktop.chooseAndPreviewLocalTheme).toHaveBeenCalledWith("zh-CN");
+  });
+
+  test("keeps the selected wallpaper and both controls after reopening", async () => {
+    const firstPath = "C:\\Workshop\\431960\\111";
+    const secondPath = "C:\\Workshop\\431960\\222";
+    desktop.getWallpaperEngineCatalog.mockResolvedValue({
+      root: "C:\\Workshop\\431960",
+      projects: [
+        { id: "111", title: "第一张壁纸", projectType: "video", projectPath: firstPath, mediaSizeBytes: 1024, requiresWallpaperEngine: false, supported: true },
+        { id: "222", title: "上次使用的壁纸", projectType: "video", projectPath: secondPath, mediaSizeBytes: 2048, requiresWallpaperEngine: false, supported: true },
+      ],
+    });
+
+    const firstRender = renderApp();
+    fireEvent.click(screen.getByRole("button", { name: "主题库" }));
+    const firstSelect = await screen.findByLabelText("选择无需打开 Wallpaper Engine 的壁纸");
+    await waitFor(() => expect(firstSelect).toHaveValue(firstPath));
+    fireEvent.change(firstSelect, { target: { value: secondPath } });
+    fireEvent.change(screen.getByRole("slider", { name: "壁纸亮度" }), { target: { value: "63" } });
+    fireEvent.change(screen.getByRole("slider", { name: "界面透明度" }), { target: { value: "72" } });
+    await waitFor(() => expect(JSON.parse(window.localStorage.getItem("retheme.wallpaper-preferences.v1") ?? "{}")).toEqual({
+      projectPath: secondPath,
+      wallpaperBrightness: 63,
+      interfaceTransparency: 72,
+    }));
+    firstRender.unmount();
+
+    renderApp();
+    fireEvent.click(screen.getByRole("button", { name: "主题库" }));
+    await waitFor(() => expect(screen.getByLabelText("选择无需打开 Wallpaper Engine 的壁纸")).toHaveValue(secondPath));
+    expect(screen.getByRole("slider", { name: "壁纸亮度" })).toHaveValue("63");
+    expect(screen.getByRole("slider", { name: "界面透明度" })).toHaveValue("72");
+  });
+
+  test("groups Wallpaper Engine projects by whether the engine is required", async () => {
+    const videoPath = "C:\\Workshop\\431960\\video";
+    const webPath = "C:\\Workshop\\431960\\web";
+    const scenePath = "C:\\Workshop\\431960\\scene";
+    const originalScenePath = "C:\\Workshop\\431960\\scene-original";
+    desktop.getWallpaperEngineCatalog.mockResolvedValue({
+      root: "C:\\Workshop\\431960",
+      projects: [
+        { id: "video", title: "本地视频", projectType: "video", projectPath: videoPath, mediaSizeBytes: 1024, requiresWallpaperEngine: false, supported: true },
+        { id: "scene", title: "场景壁纸", projectType: "scene", projectPath: scenePath, mediaSizeBytes: 2048, requiresWallpaperEngine: true, supported: true },
+        { id: "web", title: "网页壁纸", projectType: "web", projectPath: webPath, mediaSizeBytes: 4096, requiresWallpaperEngine: false, supported: true },
+        { id: "scene-original", title: "原版场景壁纸", projectType: "scene", projectPath: originalScenePath, mediaSizeBytes: 8192, requiresWallpaperEngine: true, supported: true },
+      ],
+    });
+
+    renderApp();
+    fireEvent.click(screen.getByRole("button", { name: "主题库" }));
+    const withoutEngine = await screen.findByLabelText("选择无需打开 Wallpaper Engine 的壁纸");
+    const withEngine = screen.getByLabelText("选择与 Wallpaper Engine 桌面同步的壁纸");
+    await waitFor(() => expect(withoutEngine.querySelectorAll("option")).toHaveLength(3));
+
+    expect(screen.getByText("无需打开 Wallpaper Engine")).toBeVisible();
+    expect(screen.getByText("1 Video · 1 Web")).toBeVisible();
+    expect(screen.getByText("同步 Wallpaper Engine 桌面")).toBeVisible();
+    expect(screen.getByText("2 原生分辨率原版 Scene")).toBeVisible();
+    expect([...withoutEngine.querySelectorAll("option")].slice(1).map((option) => option.value)).toEqual([
+      videoPath,
+      webPath,
+    ]);
+    expect([...withEngine.querySelectorAll("option")].slice(1).map((option) => option.value)).toEqual([
+      scenePath,
+      originalScenePath,
+    ]);
+    fireEvent.change(withEngine, { target: { value: scenePath } });
+    expect(screen.getByText("应用后会同步替换主显示器桌面壁纸；ReTheme 使用屏幕外干净捕获窗口")).toBeVisible();
+  });
+
+  test("migrates the previous background opacity into wallpaper brightness", async () => {
+    window.localStorage.setItem("retheme.wallpaper-preferences.v1", JSON.stringify({
+      projectPath: "C:\\Workshop\\431960\\333",
+      backgroundOpacity: 41,
+    }));
+
+    renderApp();
+    fireEvent.click(screen.getByRole("button", { name: "主题库" }));
+
+    expect(await screen.findByRole("slider", { name: "壁纸亮度" })).toHaveValue("41");
+    expect(screen.getByRole("slider", { name: "界面透明度" })).toHaveValue("32");
+  });
+
+  test("hydrates and synchronizes wallpaper controls through the desktop runtime", async () => {
+    desktop.isDesktopRuntime.mockReturnValue(true);
+    let saved = { wallpaperBrightness: 81, interfaceTransparency: 67 };
+    desktop.getWallpaperControlPreferences.mockImplementation(async () => saved);
+    desktop.updateWallpaperControls.mockImplementation(async (controls) => {
+      saved = controls;
+      return controls;
+    });
+
+    renderApp();
+    fireEvent.click(screen.getByRole("button", { name: "主题库" }));
+    expect(await screen.findByRole("slider", { name: "壁纸亮度" })).toHaveValue("81");
+    expect(screen.getByRole("slider", { name: "界面透明度" })).toHaveValue("67");
+
+    fireEvent.change(screen.getByRole("slider", { name: "界面透明度" }), { target: { value: "74" } });
+    await waitFor(() => expect(desktop.updateWallpaperControls).toHaveBeenCalledWith({
+      wallpaperBrightness: 81,
+      interfaceTransparency: 74,
+    }));
   });
 
   test("keeps local themes unlimited without Pro", async () => {

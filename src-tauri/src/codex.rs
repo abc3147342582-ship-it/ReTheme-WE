@@ -1,16 +1,18 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::process::Child;
 #[cfg(any(not(target_os = "windows"), test))]
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
@@ -33,8 +35,11 @@ use crate::{compatibility, theme};
 const CODEX_BUNDLE_ID: &str = "com.openai.codex";
 #[cfg(target_os = "windows")]
 const CODEX_PACKAGE_NAME: &str = "OpenAI.Codex";
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_ISOLATED_START_ATTEMPTS: usize = 2;
 const THEME_CHANNEL_IO_TIMEOUT: Duration = Duration::from_secs(3);
+const TARGET_READY_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
+const TARGET_READY_STABILITY: Duration = Duration::from_millis(300);
 const STATUS_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 const STATUS_PROBE_GRACE_PERIOD: Duration = Duration::from_secs(15);
 const PAGE_LEASE_DURATION: Duration = Duration::from_secs(15);
@@ -65,6 +70,8 @@ const PAGE_RESTORE_THEME_FUNCTION: &str = r#"(expectedSessionId = null, closeWin
   if (runtime?.metricsFrame) cancelAnimationFrame(runtime.metricsFrame);
   if (runtime?.resizeFrame) cancelAnimationFrame(runtime.resizeFrame);
   if (runtime?.leaseTimer) clearInterval(runtime.leaseTimer);
+  if (runtime?.wallpaperPlaybackTimer) clearInterval(runtime.wallpaperPlaybackTimer);
+  runtime?.clearWallpaperControlPersistence?.();
   if (revokeAssets) runtime?.revokeAssets?.();
   if (window[runtimeKey] === runtime) delete window[runtimeKey];
   document.querySelectorAll('[data-ct-home-prompt-native]').forEach(node => {
@@ -82,6 +89,8 @@ const PAGE_RESTORE_THEME_FUNCTION: &str = r#"(expectedSessionId = null, closeWin
   document.documentElement?.removeAttribute('data-ct-color-scheme');
   document.documentElement?.style.removeProperty('--ct-home-card-count');
   document.documentElement?.style.removeProperty('--ct-titlebar-safe-top');
+  document.documentElement?.style.removeProperty('--ct-wallpaper-brightness');
+  document.documentElement?.style.removeProperty('--ct-interface-opacity');
   document.querySelectorAll('[data-ct-slot="conversation.stage"]').forEach(node => {
     node.style.removeProperty('--ct-conversation-banner-clearance');
     node.style.removeProperty('--ct-conversation-summary-width');
@@ -143,7 +152,7 @@ const PLATFORM_RUNTIME_CSS: &str = r#"
   overflow: hidden !important;
   pointer-events: none !important;
 }
-[data-ct-mount="app.background"] > img {
+[data-ct-mount="app.background"] > :where(img, video, iframe, canvas) {
   display: block !important;
   width: 100% !important;
   height: 100% !important;
@@ -331,6 +340,26 @@ const PLATFORM_RUNTIME_CSS: &str = r#"
   overflow: hidden !important;
   border: 0 !important;
   box-shadow: none !important;
+}
+:where([data-ct-slot="composer.region"]) {
+  background: transparent !important;
+  background-image: none !important;
+  box-shadow: none !important;
+  filter: none !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+:where([data-ct-slot="composer.region"])::before,
+:where([data-ct-slot="composer.region"])::after {
+  display: none !important;
+  border: 0 !important;
+  background: transparent !important;
+  background-image: none !important;
+  box-shadow: none !important;
+  filter: none !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  content: none !important;
 }
 [data-ct-slot="composer.backdrop"] {
   display: none !important;
@@ -567,7 +596,12 @@ const REQUIRED_CONVERSATION_STARTUP_SLOTS: &[&str] = &[
     "conversation.viewport",
     "conversation",
 ];
-const REQUIRED_STARTUP_VIEW: &str = "view:home|home-compact|conversation";
+// Startup can briefly stop at an auxiliary shell while account state and the
+// composer are still loading. The background mount and the long-lived DOM
+// observer are already useful in that state; the observer fills the remaining
+// slots as soon as the normal home/conversation view appears.
+const REQUIRED_OTHER_STARTUP_SLOTS: &[&str] = &["app.shell", "app.background"];
+const REQUIRED_STARTUP_VIEW: &str = "view:home|home-compact|conversation|other";
 
 #[derive(Debug)]
 pub struct CodexError(String);
@@ -609,6 +643,11 @@ impl CodexInstallation {
 pub struct SmokeTestReport {
     app_version: String,
     browser_version: String,
+    adapter_id: String,
+    version_matched: bool,
+    adapter_compatible: bool,
+    missing_adapter_probes: Vec<String>,
+    compatible: bool,
     port: u16,
     target_title: String,
     target_url: String,
@@ -661,10 +700,207 @@ struct ThemeSession {
     id: u64,
     instance: TestInstance,
     _asset_server: Option<ThemeAssetServer>,
+    _scene_frame_pump: Option<SceneFramePump>,
     port: u16,
+    apply_expression: String,
+    local_wallpaper_file: Option<PathBuf>,
+    wallpaper_controls: Option<theme::WallpaperControls>,
     deadline: Option<Instant>,
     target_missing_since: Option<Instant>,
     report: ThemePreviewReport,
+}
+
+struct SceneFramePump {
+    shutdown: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl SceneFramePump {
+    fn start(
+        port: u16,
+        session_id: u64,
+        capture: Arc<crate::wallpaper_engine::SceneWallpaperCapture>,
+    ) -> Result<Self, CodexError> {
+        let capture_mode = capture.mode().as_str();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = shutdown.clone();
+        let thread = thread::Builder::new()
+            .name("retheme-scene-frame-pump".into())
+            .spawn(move || {
+                run_scene_frame_pump(capture, thread_shutdown, port, session_id);
+            })?;
+        let mut pump = Self {
+            shutdown,
+            thread: Some(thread),
+        };
+        if let Err(error) = enable_scene_frame_channel(port, session_id, capture_mode) {
+            pump.stop();
+            return Err(error);
+        }
+        Ok(pump)
+    }
+
+    fn stop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for SceneFramePump {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn run_scene_frame_pump(
+    capture: Arc<crate::wallpaper_engine::SceneWallpaperCapture>,
+    shutdown: Arc<AtomicBool>,
+    port: u16,
+    session_id: u64,
+) {
+    let mut worker = crate::wallpaper_engine::SceneWallpaperCapture::capture_worker();
+    let mut socket: Option<WebSocket<TcpStream>> = None;
+    let mut command_id = 10_000_u64;
+    while !shutdown.load(Ordering::Acquire) {
+        if socket.is_none() {
+            socket = find_codex_target(port, Duration::from_millis(500))
+                .ok()
+                .flatten()
+                .and_then(|target| {
+                    connect_theme_channel_with_timeout(
+                        &target.web_socket_debugger_url,
+                        Duration::from_secs(1),
+                    )
+                    .ok()
+                });
+            if socket.is_none() {
+                thread::sleep(Duration::from_millis(250));
+                continue;
+            }
+        }
+        if capture.is_paused() {
+            thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        let frame_started = Instant::now();
+        let frame = match capture.capture_jpeg(&mut worker) {
+            Ok(frame) => frame,
+            Err(_) => {
+                thread::sleep(Duration::from_millis(250));
+                continue;
+            }
+        };
+        let encoded_frame = BASE64_STANDARD.encode(frame.jpeg.as_ref());
+        let expression = format!(
+            "window.__codexThemeRuntime?.sessionId === {session_id} && window.__codexThemeRuntime?.pushSceneFrame?.('{encoded_frame}', {}) === true",
+            frame.sequence
+        );
+        command_id = command_id.wrapping_add(1).max(10_000);
+        let sent = socket.as_mut().is_some_and(|socket| {
+            send_cdp_command(
+                socket,
+                command_id,
+                "Runtime.evaluate",
+                json!({ "expression": expression, "returnByValue": true }),
+            )
+            .is_ok()
+        });
+        if !sent {
+            socket = None;
+        }
+        let remaining = crate::wallpaper_engine::SceneWallpaperCapture::frame_interval()
+            .saturating_sub(frame_started.elapsed());
+        if !remaining.is_zero() {
+            thread::sleep(remaining);
+        }
+    }
+}
+
+fn enable_scene_frame_channel(
+    port: u16,
+    session_id: u64,
+    capture_mode: &str,
+) -> Result<(), CodexError> {
+    let target = find_codex_target(port, Duration::from_secs(2))?
+        .ok_or_else(|| CodexError("找不到 ChatGPT Scene 帧页面".into()))?;
+    let mut socket = connect_theme_channel(&target.web_socket_debugger_url)?;
+    let encoded_capture_mode = serde_json::to_string(capture_mode)
+        .map_err(|error| CodexError(format!("无法编码 Scene 抓取模式：{error}")))?;
+    let attached = evaluate_value(
+        &mut socket,
+        1,
+        &format!(
+            r#"(() => {{
+              const runtime = window.__codexThemeRuntime;
+              if (runtime?.sessionId !== {session_id}) return false;
+              runtime.sceneCaptureMode = {encoded_capture_mode};
+              return runtime.startSceneFrameLoop?.() === true;
+            }})()"#
+        ),
+    )?
+    .as_bool()
+    .unwrap_or(false);
+    let _ = socket.close(None);
+    attached
+        .then_some(())
+        .ok_or_else(|| CodexError("ChatGPT 没有启用 Scene 内存帧通道".into()))
+}
+
+#[derive(Clone)]
+pub struct WallpaperControlsStore {
+    path: Arc<PathBuf>,
+    value: Arc<Mutex<Option<theme::WallpaperControls>>>,
+}
+
+impl WallpaperControlsStore {
+    pub fn new(path: PathBuf) -> Self {
+        let value = fs::read_to_string(&path)
+            .ok()
+            .and_then(|source| serde_json::from_str::<theme::WallpaperControls>(&source).ok())
+            .and_then(|controls| {
+                theme::WallpaperControls::new(
+                    controls.wallpaper_brightness,
+                    controls.interface_transparency,
+                )
+                .ok()
+            });
+        Self {
+            path: Arc::new(path),
+            value: Arc::new(Mutex::new(value)),
+        }
+    }
+
+    pub fn get(&self) -> Result<Option<theme::WallpaperControls>, CodexError> {
+        self.value
+            .lock()
+            .map(|value| *value)
+            .map_err(|_| CodexError("动态壁纸调节设置已损坏".into()))
+    }
+
+    pub fn set(
+        &self,
+        controls: theme::WallpaperControls,
+    ) -> Result<theme::WallpaperControls, CodexError> {
+        let controls = theme::WallpaperControls::new(
+            controls.wallpaper_brightness,
+            controls.interface_transparency,
+        )
+        .map_err(|error| CodexError(error.to_string()))?;
+        let mut value = self
+            .value
+            .lock()
+            .map_err(|_| CodexError("动态壁纸调节设置已损坏".into()))?;
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let source = serde_json::to_vec_pretty(&controls)
+            .map_err(|error| CodexError(format!("无法编码动态壁纸调节设置：{error}")))?;
+        fs::write(self.path.as_ref(), source)?;
+        *value = Some(controls);
+        Ok(controls)
+    }
 }
 
 struct ThemeAssetServer {
@@ -674,9 +910,19 @@ struct ThemeAssetServer {
 }
 
 impl ThemeAssetServer {
+    #[cfg(test)]
     fn start(
         assets: Vec<theme::ThemeRuntimeAsset>,
     ) -> Result<(Self, HashMap<String, String>, String), CodexError> {
+        let (server, urls, revoke_url, _) = Self::start_with_controls(assets, None, None)?;
+        Ok((server, urls, revoke_url))
+    }
+
+    fn start_with_controls(
+        assets: Vec<theme::ThemeRuntimeAsset>,
+        controls_store: Option<WallpaperControlsStore>,
+        scene_capture: Option<Arc<crate::wallpaper_engine::SceneWallpaperCapture>>,
+    ) -> Result<(Self, HashMap<String, String>, String, Option<String>), CodexError> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         listener.set_nonblocking(true)?;
         let address = listener.local_addr()?;
@@ -688,12 +934,22 @@ impl ThemeAssetServer {
         let mut urls = HashMap::with_capacity(indexed_assets.len());
         let mut routes = HashMap::with_capacity(indexed_assets.len());
         for (index, asset) in indexed_assets.into_iter().enumerate() {
-            let route = format!("/{token}/{index}");
+            let route = asset
+                .route_path
+                .as_deref()
+                .map(|path| format!("/{token}/{}", encode_loopback_route_path(path)))
+                .unwrap_or_else(|| format!("/{token}/{index}"));
             urls.insert(asset.path.clone(), format!("http://{address}{route}"));
             routes.insert(route, asset);
         }
         let revoke_url = format!("http://{address}/{token}/revoke");
         let revoke_path = format!("/{token}/revoke");
+        let controls_url = controls_store
+            .as_ref()
+            .map(|_| format!("http://{address}/{token}/controls"));
+        let controls_path = controls_store
+            .as_ref()
+            .map(|_| format!("/{token}/controls"));
         let routes = Arc::new(routes);
         let shutdown = Arc::new(AtomicBool::new(false));
         let server_shutdown = shutdown.clone();
@@ -719,6 +975,9 @@ impl ThemeAssetServer {
                             }
                             let routes = routes.clone();
                             let revoke_path = revoke_path.clone();
+                            let controls_path = controls_path.clone();
+                            let controls_store = controls_store.clone();
+                            let scene_capture = scene_capture.clone();
                             let shutdown = server_shutdown.clone();
                             let stopped = server_stopped.clone();
                             if let Ok(connection) = thread::Builder::new()
@@ -728,6 +987,9 @@ impl ThemeAssetServer {
                                         &mut stream,
                                         address,
                                         &revoke_path,
+                                        controls_path.as_deref(),
+                                        controls_store.as_ref(),
+                                        scene_capture.as_ref(),
                                         &routes,
                                         &shutdown,
                                         &stopped,
@@ -755,6 +1017,7 @@ impl ThemeAssetServer {
             },
             urls,
             revoke_url,
+            controls_url,
         ))
     }
 }
@@ -777,6 +1040,9 @@ fn serve_theme_asset_request(
     stream: &mut TcpStream,
     address: SocketAddr,
     revoke_path: &str,
+    controls_path: Option<&str>,
+    controls_store: Option<&WallpaperControlsStore>,
+    scene_capture: Option<&Arc<crate::wallpaper_engine::SceneWallpaperCapture>>,
     routes: &HashMap<String, theme::ThemeRuntimeAsset>,
     shutdown: &AtomicBool,
     stopped: &AtomicBool,
@@ -816,15 +1082,21 @@ fn serve_theme_asset_request(
     }) else {
         return write_theme_asset_error(stream, 400, "Bad Request");
     };
-    if !matches!(method, "GET" | "HEAD") || version != "HTTP/1.1" {
+    if !matches!(method, "GET" | "HEAD" | "OPTIONS") || version != "HTTP/1.1" {
         return write_theme_asset_error(stream, 404, "Not Found");
     }
     let expected_host = address.to_string();
-    let valid_host = lines.any(|line| {
-        line.split_once(':').is_some_and(|(name, value)| {
-            name.eq_ignore_ascii_case("host") && value.trim() == expected_host
-        })
-    });
+    let mut valid_host = false;
+    let mut range_header = None;
+    for line in lines {
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("host") && value.trim() == expected_host {
+                valid_host = true;
+            } else if name.eq_ignore_ascii_case("range") {
+                range_header = Some(value.trim());
+            }
+        }
+    }
     if valid_host && path == revoke_path {
         shutdown.store(true, Ordering::Release);
         while !stopped.load(Ordering::Acquire) {
@@ -832,23 +1104,181 @@ fn serve_theme_asset_request(
         }
         return write_theme_asset_error(stream, 204, "No Content");
     }
-    let Some(asset) = valid_host.then(|| routes.get(path)).flatten() else {
+    if valid_host
+        && let (Some(controls_path), Some(controls_store)) = (controls_path, controls_store)
+        && let Some(query) = path
+            .strip_prefix(controls_path)
+            .and_then(|suffix| suffix.strip_prefix('?'))
+    {
+        let Some(parsed) = parse_wallpaper_controls_query(query) else {
+            return write_theme_asset_error(stream, 400, "Bad Request");
+        };
+        if controls_store.set(parsed.controls).is_err() {
+            return write_theme_asset_error(stream, 500, "Internal Server Error");
+        }
+        if let (Some(capture), Some(paused)) = (scene_capture, parsed.playback_paused) {
+            capture.set_paused(paused);
+        }
+        return write_theme_asset_error(stream, 204, "No Content");
+    }
+    let asset_path = path.split_once('?').map_or(path, |(path, _)| path);
+    let Some(asset) = valid_host.then(|| routes.get(asset_path)).flatten() else {
         return write_theme_asset_error(stream, 404, "Not Found");
+    };
+    if method == "OPTIONS" {
+        write!(
+            stream,
+            "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, HEAD, OPTIONS\r\nAccess-Control-Allow-Private-Network: true\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+        )?;
+        stream.flush()?;
+        let _ = stream.shutdown(Shutdown::Write);
+        return Ok(());
+    }
+    let asset_length = match &asset.source {
+        theme::ThemeRuntimeAssetSource::Memory(source) => source.len() as u64,
+        theme::ThemeRuntimeAssetSource::File(path) => match fs::metadata(path) {
+            Ok(metadata) if metadata.is_file() => metadata.len(),
+            _ => return write_theme_asset_error(stream, 404, "Not Found"),
+        },
+    };
+    let byte_range = match range_header {
+        Some(value) => match parse_theme_asset_range(value, asset_length) {
+            Some(range) => Some(range),
+            None => {
+                write!(
+                    stream,
+                    "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{asset_length}\r\nContent-Length: 0\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+                )?;
+                stream.flush()?;
+                let _ = stream.shutdown(Shutdown::Write);
+                return Ok(());
+            }
+        },
+        None => None,
+    };
+    let (start, end) = byte_range.unwrap_or_else(|| {
+        if asset_length == 0 {
+            (0, 0)
+        } else {
+            (0, asset_length - 1)
+        }
+    });
+    let response_length = if asset_length == 0 {
+        0
+    } else {
+        end - start + 1
+    };
+    let (status, content_range) = if byte_range.is_some() {
+        (
+            "206 Partial Content",
+            format!("Content-Range: bytes {start}-{end}/{asset_length}\r\n"),
+        )
+    } else {
+        ("200 OK", String::new())
+    };
+    let content_security_policy = match asset.policy {
+        theme::ThemeAssetPolicy::Media => "default-src 'none'".to_owned(),
+        theme::ThemeAssetPolicy::SandboxedWeb => format!(
+            "default-src http://{address} data: blob:; script-src http://{address} 'unsafe-inline'; style-src http://{address} 'unsafe-inline'; img-src http://{address} data: blob:; media-src http://{address} data: blob:; font-src http://{address} data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"
+        ),
     };
     write!(
         stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: private, no-store\r\nCross-Origin-Resource-Policy: cross-origin\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; img-src data:\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: {}\r\nContent-Length: {response_length}\r\n{content_range}Accept-Ranges: bytes\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Private-Network: true\r\nCache-Control: private, no-store\r\nCross-Origin-Resource-Policy: cross-origin\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: {content_security_policy}\r\nConnection: close\r\n\r\n",
         asset.mime,
-        asset.source.len(),
     )?;
-    if method == "GET" {
-        for chunk in asset.source.chunks(64 * 1024) {
-            stream.write_all(chunk)?;
+    if method == "GET" && response_length > 0 {
+        match &asset.source {
+            theme::ThemeRuntimeAssetSource::Memory(source) => {
+                stream.write_all(&source[start as usize..=end as usize])?;
+            }
+            theme::ThemeRuntimeAssetSource::File(path) => {
+                let mut file = fs::File::open(path)?;
+                file.seek(SeekFrom::Start(start))?;
+                std::io::copy(&mut file.take(response_length), stream)?;
+            }
         }
     }
     stream.flush()?;
     let _ = stream.shutdown(Shutdown::Write);
     Ok(())
+}
+
+fn encode_loopback_route_path(path: &str) -> String {
+    let mut encoded = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/') {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
+struct ParsedWallpaperControls {
+    controls: theme::WallpaperControls,
+    playback_paused: Option<bool>,
+}
+
+fn parse_wallpaper_controls_query(query: &str) -> Option<ParsedWallpaperControls> {
+    let mut wallpaper_brightness = None;
+    let mut interface_transparency = None;
+    let mut playback_paused = None;
+    for part in query.split('&') {
+        let (name, value) = part.split_once('=')?;
+        match name {
+            "wallpaperBrightness" if wallpaper_brightness.is_none() => {
+                wallpaper_brightness = Some(value.parse::<u8>().ok()?);
+            }
+            "interfaceTransparency" if interface_transparency.is_none() => {
+                interface_transparency = Some(value.parse::<u8>().ok()?);
+            }
+            "playbackPaused" if playback_paused.is_none() => {
+                playback_paused = Some(match value {
+                    "true" => true,
+                    "false" => false,
+                    _ => return None,
+                });
+            }
+            _ => return None,
+        }
+    }
+    Some(ParsedWallpaperControls {
+        controls: theme::WallpaperControls::new(wallpaper_brightness?, interface_transparency?)
+            .ok()?,
+        playback_paused,
+    })
+}
+
+fn parse_theme_asset_range(value: &str, length: u64) -> Option<(u64, u64)> {
+    if length == 0 {
+        return None;
+    }
+    let value = value.strip_prefix("bytes=")?;
+    if value.contains(',') {
+        return None;
+    }
+    let (start, end) = value.split_once('-')?;
+    if start.is_empty() {
+        let suffix = end.parse::<u64>().ok()?;
+        if suffix == 0 {
+            return None;
+        }
+        let start = length.saturating_sub(suffix);
+        return Some((start, length - 1));
+    }
+    let start = start.parse::<u64>().ok()?;
+    if start >= length {
+        return None;
+    }
+    let end = if end.is_empty() {
+        length - 1
+    } else {
+        end.parse::<u64>().ok()?.min(length - 1)
+    };
+    (start <= end).then_some((start, end))
 }
 
 fn write_theme_asset_error(
@@ -928,7 +1358,7 @@ impl ThemeRuntime {
     }
 
     pub fn renew_page_lease(&self) -> Result<bool, CodexError> {
-        let (session_id, port) = {
+        let (session_id, port, apply_expression, local_wallpaper_file, wallpaper_controls) = {
             let session = self
                 .session
                 .lock()
@@ -936,12 +1366,37 @@ impl ThemeRuntime {
             let Some(session) = session.as_ref() else {
                 return Ok(false);
             };
-            (session.id, session.port)
+            (
+                session.id,
+                session.port,
+                session.apply_expression.clone(),
+                session.local_wallpaper_file.clone(),
+                session.wallpaper_controls,
+            )
         };
         let Some(target) = find_codex_target(port, STATUS_PROBE_TIMEOUT)? else {
             return Ok(false);
         };
-        renew_theme_lease(&target.web_socket_debugger_url, session_id)
+        if renew_theme_lease(&target.web_socket_debugger_url, session_id)? {
+            return Ok(true);
+        }
+
+        apply_theme_expression(&target.web_socket_debugger_url, &apply_expression)?;
+        if let Some(wallpaper_path) = local_wallpaper_file {
+            attach_local_wallpaper_file(
+                &target.web_socket_debugger_url,
+                session_id,
+                &wallpaper_path,
+            )?;
+        }
+        if let Some(controls) = wallpaper_controls {
+            set_wallpaper_controls_on_target(
+                &target.web_socket_debugger_url,
+                session_id,
+                controls,
+            )?;
+        }
+        Ok(true)
     }
 
     fn next_session_id(&self) -> u64 {
@@ -955,6 +1410,7 @@ impl ThemeRuntime {
 enum ThemePreviewSource {
     Installed,
     LocalDevelopment,
+    WallpaperEngine,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1225,9 +1681,46 @@ fn plist_string<'a>(dictionary: &'a plist::Dictionary, key: &str) -> Result<&'a 
 }
 
 pub fn run_smoke_test() -> Result<SmokeTestReport, CodexError> {
-    let started_at = Instant::now();
     let installation = detect()?;
-    let mut instance = start_isolated(&installation)?;
+    let adapter = compatibility::builtin_adapter(&installation.version);
+    run_smoke_test_with_adapter(installation, adapter)
+}
+
+pub fn run_compatibility_self_check(
+    compatibility: &compatibility::CompatibilityRepository,
+) -> Result<SmokeTestReport, CodexError> {
+    let installation = detect()?;
+    let adapter = compatibility.adapter(&installation.version);
+    run_smoke_test_with_adapter(installation, adapter)
+}
+
+fn run_smoke_test_with_adapter(
+    installation: CodexInstallation,
+    adapter: compatibility::CodexAdapter,
+) -> Result<SmokeTestReport, CodexError> {
+    let started_at = Instant::now();
+    for attempt in 0..MAX_ISOLATED_START_ATTEMPTS {
+        match run_smoke_test_attempt(&installation, &adapter, started_at) {
+            Ok(report)
+                if report.version_matched
+                    && !report.adapter_compatible
+                    && attempt + 1 < MAX_ISOLATED_START_ATTEMPTS => {}
+            Ok(report) => return Ok(report),
+            Err(error)
+                if attempt + 1 < MAX_ISOLATED_START_ATTEMPTS
+                    && is_retryable_isolated_start_error(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("isolated startup attempts must return a result")
+}
+
+fn run_smoke_test_attempt(
+    installation: &CodexInstallation,
+    adapter: &compatibility::CodexAdapter,
+    started_at: Instant,
+) -> Result<SmokeTestReport, CodexError> {
+    let mut instance = start_isolated(installation)?;
     let (port, _) = wait_for_devtools(instance._profile.path(), &mut instance.process)?;
     let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     let loopback_only = verify_loopback(socket, instance.process.id())?;
@@ -1238,10 +1731,20 @@ pub fn run_smoke_test() -> Result<SmokeTestReport, CodexError> {
     if !probe_applied || !probe_removed {
         return Err(CodexError("本地主题通道没有完成应用与撤销闭环".into()));
     }
+    let missing_adapter_probes = test_adapter_probes(&target.web_socket_debugger_url, adapter)?;
+    let version_matched = adapter.supports_version(&installation.version);
+    let adapter_compatible = missing_adapter_probes.is_empty();
+    let compatible =
+        loopback_only && probe_applied && probe_removed && version_matched && adapter_compatible;
 
     Ok(SmokeTestReport {
-        app_version: installation.version,
+        app_version: installation.version.clone(),
         browser_version: version.browser,
+        adapter_id: adapter.id.clone(),
+        version_matched,
+        adapter_compatible,
+        missing_adapter_probes,
+        compatible,
         port,
         target_title: target.title,
         target_url: target.url,
@@ -1284,6 +1787,7 @@ pub fn start_theme_preview_until(
         expires_at,
         has_pro,
         locale,
+        None,
     )
 }
 
@@ -1311,6 +1815,34 @@ pub fn start_development_theme_preview(
         expires_at,
         has_pro,
         locale,
+        None,
+    )
+}
+
+pub fn start_wallpaper_engine_preview(
+    runtime: &ThemeRuntime,
+    compatibility: &compatibility::CompatibilityRepository,
+    project_path: &Path,
+    controls: theme::WallpaperControls,
+    controls_store: &WallpaperControlsStore,
+    has_pro: bool,
+    locale: &str,
+) -> Result<ThemePreviewReport, CodexError> {
+    if runtime.current_preview()?.is_some() {
+        return Err(CodexError("已有主题预览正在运行，请先恢复当前主题".into()));
+    }
+    let controls = controls_store.set(controls)?;
+    let package = theme::load_wallpaper_engine_project(project_path, controls)
+        .map_err(|error| CodexError(error.to_string()))?;
+    start_theme_package_preview(
+        runtime,
+        compatibility,
+        package,
+        ThemePreviewSource::WallpaperEngine,
+        None,
+        has_pro,
+        locale,
+        Some(controls_store.clone()),
     )
 }
 
@@ -1322,42 +1854,92 @@ fn start_theme_package_preview(
     expires_at: Option<u64>,
     has_pro: bool,
     locale: &str,
+    controls_store: Option<WallpaperControlsStore>,
 ) -> Result<ThemePreviewReport, CodexError> {
     let installation = detect()?;
     let adapter = compatibility.adapter(&installation.version);
 
-    let mut instance = start_isolated(&installation)?;
+    for attempt in 0..MAX_ISOLATED_START_ATTEMPTS {
+        match start_theme_package_preview_attempt(
+            runtime,
+            &installation,
+            &adapter,
+            package.clone(),
+            source,
+            expires_at,
+            has_pro,
+            locale,
+            controls_store.clone(),
+        ) {
+            Err(error)
+                if attempt + 1 < MAX_ISOLATED_START_ATTEMPTS
+                    && is_retryable_isolated_start_error(&error) => {}
+            result => return result,
+        }
+    }
+    unreachable!("isolated startup attempts must return a result")
+}
+
+fn start_theme_package_preview_attempt(
+    runtime: &ThemeRuntime,
+    installation: &CodexInstallation,
+    adapter: &compatibility::CodexAdapter,
+    package: theme::ThemePackage,
+    source: ThemePreviewSource,
+    expires_at: Option<u64>,
+    has_pro: bool,
+    locale: &str,
+    controls_store: Option<WallpaperControlsStore>,
+) -> Result<ThemePreviewReport, CodexError> {
+    let mut instance = start_isolated(installation)?;
     let (port, _) = wait_for_devtools(instance._profile.path(), &mut instance.process)?;
     let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     let loopback_only = verify_loopback(socket, instance.process.id())?;
     let target = wait_for_codex_target(port, &mut instance.process)?;
     let session_id = runtime.next_session_id();
     let remaining = expires_at.map(remaining_until).transpose()?.flatten();
-    let (asset_server, asset_urls, revoke_assets_url) =
-        ThemeAssetServer::start(package.runtime_assets())?;
-    let runtime_config = package
+    let local_wallpaper_file = package.wallpaper_file_path().map(Path::to_path_buf);
+    let scene_capture = package.wallpaper_scene();
+    let wallpaper_controls = package.wallpaper_controls();
+    let (asset_server, asset_urls, revoke_assets_url, controls_url) =
+        ThemeAssetServer::start_with_controls(
+            package.runtime_assets(),
+            wallpaper_controls.and(controls_store),
+            scene_capture.clone(),
+        )?;
+    let mut runtime_config = package
         .runtime_config_with_asset_urls(&asset_urls)
         .map_err(|error| CodexError(error.to_string()))?;
-    let applied_slots = apply_theme(
+    if let Some(controls_url) = controls_url
+        && let Some(wallpaper) = runtime_config.get_mut("wallpaper")
+    {
+        wallpaper["controlUrl"] = Value::String(controls_url);
+    }
+    let (applied_slots, apply_expression) = apply_theme(
         &target.web_socket_debugger_url,
         &package,
         ThemeApplication {
             runtime_config: &runtime_config,
             revoke_assets_url: &revoke_assets_url,
-            adapter: &adapter,
+            adapter,
             session_id,
             expires_at,
             has_pro,
             locale,
         },
     )?;
-
+    if let Some(wallpaper_path) = local_wallpaper_file.as_deref() {
+        attach_local_wallpaper_file(&target.web_socket_debugger_url, session_id, wallpaper_path)?;
+    }
+    let scene_frame_pump = scene_capture
+        .map(|capture| SceneFramePump::start(port, session_id, capture))
+        .transpose()?;
     let report = ThemePreviewReport {
         theme_id: package.id().to_owned(),
         theme: package.preview_summary(),
         source,
         expires_at,
-        app_version: installation.version,
+        app_version: installation.version.clone(),
         port,
         applied_slots,
         loopback_only,
@@ -1374,13 +1956,180 @@ fn start_theme_package_preview(
         id: session_id,
         instance,
         _asset_server: Some(asset_server),
+        _scene_frame_pump: scene_frame_pump,
         port,
+        apply_expression,
+        local_wallpaper_file,
+        wallpaper_controls,
         deadline: remaining.map(|duration| Instant::now() + duration),
         target_missing_since: None,
         report: report.clone(),
     });
 
     Ok(report)
+}
+
+fn is_retryable_isolated_start_error(error: &CodexError) -> bool {
+    [
+        "隔离 ChatGPT 提前退出",
+        "等待 ChatGPT",
+        "等待稳定的 ChatGPT",
+        "无法连接本地主题通道",
+        "无法握手本地主题通道",
+        "读取本地主题通道响应失败",
+        "本地主题通道响应提前结束",
+        "本地主题通道请求失败",
+        "本地主题通道没有完成应用与撤销闭环",
+        "os error 10060",
+    ]
+    .iter()
+    .any(|marker| error.0.contains(marker))
+}
+
+fn attach_local_wallpaper_file(
+    websocket_url: &str,
+    session_id: u64,
+    wallpaper_path: &Path,
+) -> Result<(), CodexError> {
+    let wallpaper_path = fs::canonicalize(wallpaper_path)
+        .map_err(|error| CodexError(format!("无法读取动态壁纸文件：{error}")))?;
+    if !wallpaper_path.is_file() {
+        return Err(CodexError("动态壁纸文件不存在".into()));
+    }
+    let wallpaper_path = wallpaper_path
+        .to_str()
+        .ok_or_else(|| CodexError("动态壁纸路径不是有效的 Unicode".into()))?;
+    let input_id = format!("codex-theme-wallpaper-file-{session_id}");
+    let encoded_input_id = serde_json::to_string(&input_id)
+        .map_err(|error| CodexError(format!("无法编码动态壁纸文件输入：{error}")))?;
+    let mut socket = connect_theme_channel(websocket_url)?;
+
+    let result = (|| -> Result<(), CodexError> {
+        let created = evaluate_value(
+            &mut socket,
+            1,
+            &format!(
+                r#"(() => {{
+                  const runtime = window.__codexThemeRuntime;
+                  if (runtime?.sessionId !== {session_id}) return false;
+                  document.getElementById({encoded_input_id})?.remove();
+                  const input = document.createElement('input');
+                  input.type = 'file';
+                  input.accept = 'video/*,image/*';
+                  input.id = {encoded_input_id};
+                  input.hidden = true;
+                  document.body.appendChild(input);
+                  return true;
+                }})()"#
+            ),
+        )?
+        .as_bool()
+        .unwrap_or(false);
+        if !created {
+            return Err(CodexError("动态壁纸运行时尚未就绪".into()));
+        }
+
+        let document = send_cdp_command(&mut socket, 2, "DOM.getDocument", json!({ "depth": 0 }))?;
+        let document_node_id = document
+            .pointer("/root/nodeId")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| CodexError("无法定位动态壁纸页面文档".into()))?;
+        let input = send_cdp_command(
+            &mut socket,
+            3,
+            "DOM.querySelector",
+            json!({ "nodeId": document_node_id, "selector": format!("#{input_id}") }),
+        )?;
+        let input_node_id = input
+            .get("nodeId")
+            .and_then(Value::as_u64)
+            .filter(|node_id| *node_id != 0)
+            .ok_or_else(|| CodexError("无法定位动态壁纸文件输入".into()))?;
+        send_cdp_command(
+            &mut socket,
+            4,
+            "DOM.setFileInputFiles",
+            json!({ "files": [wallpaper_path], "nodeId": input_node_id }),
+        )?;
+
+        let attached = evaluate_value(
+            &mut socket,
+            5,
+            &format!(
+                r#"(() => {{
+                  const input = document.getElementById({encoded_input_id});
+                  const runtime = window.__codexThemeRuntime;
+                  const file = input?.files?.[0];
+                  const attached = runtime?.sessionId === {session_id}
+                    && runtime?.setLocalWallpaperFile?.(file);
+                  input?.remove();
+                  return Boolean(attached);
+                }})()"#
+            ),
+        )?
+        .as_bool()
+        .unwrap_or(false);
+        if !attached {
+            return Err(CodexError("动态壁纸文件没有绑定到主题页面".into()));
+        }
+
+        let started = Instant::now();
+        let mut command_id = 6;
+        loop {
+            let status = evaluate_value(
+                &mut socket,
+                command_id,
+                r#"(() => {
+                  const kind = window.__codexThemeRuntime?.wallpaperKind;
+                  const media = document.querySelector(
+                    '[data-ct-mount="app.background"] :is(video, img)'
+                  );
+                  const video = media instanceof HTMLVideoElement ? media : null;
+                  const image = media instanceof HTMLImageElement ? media : null;
+                  return {
+                    ready: kind === 'video'
+                      ? Boolean(video?.src?.startsWith('blob:') && video.readyState >= 2 && !video.paused)
+                      : Boolean(kind === 'scene' && image?.src?.startsWith('blob:')
+                          && image.complete && image.naturalWidth > 0),
+                    readyState: video?.readyState ?? -1,
+                    paused: video?.paused ?? true,
+                    errorCode: video?.error?.code ?? 0,
+                    errorMessage: video?.error?.message ?? ''
+                  };
+                })()"#,
+            )?;
+            let error_code = status.get("errorCode").and_then(Value::as_u64).unwrap_or(0);
+            if error_code != 0 {
+                let message = status
+                    .get("errorMessage")
+                    .and_then(Value::as_str)
+                    .unwrap_or("未知媒体错误");
+                return Err(CodexError(format!("动态壁纸媒体无法播放：{message}")));
+            }
+            let ready = status
+                .get("ready")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if ready {
+                return Ok(());
+            }
+            if started.elapsed() >= STARTUP_TIMEOUT {
+                return Err(CodexError("等待动态壁纸文件开始显示超时".into()));
+            }
+            command_id += 1;
+            thread::sleep(Duration::from_millis(100));
+        }
+    })();
+
+    if result.is_err() {
+        let _ = evaluate_value(
+            &mut socket,
+            10_000,
+            &format!("document.getElementById({encoded_input_id})?.remove() ?? true"),
+        );
+    }
+    let _ = socket.close(None);
+    result
 }
 
 fn remaining_until(expires_at: u64) -> Result<Option<Duration>, CodexError> {
@@ -1450,6 +2199,56 @@ pub fn sync_theme_locale(runtime: &ThemeRuntime, locale: &str) -> Result<bool, C
     Ok(synchronized)
 }
 
+pub fn update_wallpaper_controls(
+    runtime: &ThemeRuntime,
+    controls: theme::WallpaperControls,
+) -> Result<bool, CodexError> {
+    let controls = theme::WallpaperControls::new(
+        controls.wallpaper_brightness,
+        controls.interface_transparency,
+    )
+    .map_err(|error| CodexError(error.to_string()))?;
+    let (session_id, port) = {
+        let mut session = runtime
+            .session
+            .lock()
+            .map_err(|_| CodexError("主题会话状态已损坏".into()))?;
+        let Some(session) = session.as_mut() else {
+            return Ok(false);
+        };
+        if !matches!(session.report.source, ThemePreviewSource::WallpaperEngine) {
+            return Ok(false);
+        }
+        session.wallpaper_controls = Some(controls);
+        (session.id, session.port)
+    };
+    let Some(target) = find_codex_target(port, STATUS_PROBE_TIMEOUT)? else {
+        return Ok(false);
+    };
+
+    set_wallpaper_controls_on_target(&target.web_socket_debugger_url, session_id, controls)
+}
+
+fn set_wallpaper_controls_on_target(
+    websocket_url: &str,
+    session_id: u64,
+    controls: theme::WallpaperControls,
+) -> Result<bool, CodexError> {
+    let controls = serde_json::to_string(&controls)
+        .map_err(|error| CodexError(format!("动态壁纸调节设置无法编码：{error}")))?;
+    let mut socket = connect_theme_channel(websocket_url)?;
+    let expression = format!(
+        r#"(() => {{
+          const runtime = window.__codexThemeRuntime;
+          if (!runtime || runtime.sessionId !== {session_id} || !runtime.setWallpaperControls) return false;
+          return Boolean(runtime.setWallpaperControls({controls}, false));
+        }})()"#
+    );
+    let synchronized = evaluate(&mut socket, 1, &expression)?;
+    let _ = socket.close(None);
+    Ok(synchronized)
+}
+
 #[cfg(test)]
 fn stop_theme_preview_if_session(
     runtime: &ThemeRuntime,
@@ -1481,7 +2280,7 @@ fn apply_theme(
     websocket_url: &str,
     package: &theme::ThemePackage,
     application: ThemeApplication<'_>,
-) -> Result<Vec<String>, CodexError> {
+) -> Result<(Vec<String>, String), CodexError> {
     let ThemeApplication {
         runtime_config,
         revoke_assets_url,
@@ -1491,8 +2290,6 @@ fn apply_theme(
         has_pro,
         locale,
     } = application;
-    let mut socket = connect_theme_channel(websocket_url)?;
-    set_page_csp_bypass(&mut socket, 1, true)?;
     let theme_id = serde_json::to_string(package.id())
         .map_err(|error| CodexError(format!("主题 ID 无法编码：{error}")))?;
     let css = serde_json::to_string(package.css())
@@ -1573,9 +2370,17 @@ fn apply_theme(
             if (timer.textContent !== value) timer.textContent = value;
           }};
           let assetsRevoked = false;
+          let localWallpaperObjectUrl = null;
+          let startSceneFrameLoop = () => false;
+          let stopSceneFrameLoop = () => {{}};
           const revokeAssets = () => {{
             if (assetsRevoked) return;
             assetsRevoked = true;
+            stopSceneFrameLoop();
+            if (localWallpaperObjectUrl) {{
+              URL.revokeObjectURL(localWallpaperObjectUrl);
+              localWallpaperObjectUrl = null;
+            }}
             const beacon = new Image();
             beacon.onload = beacon.onerror = () => beacon.remove();
             beacon.src = revokeAssetsUrl;
@@ -1594,6 +2399,7 @@ fn apply_theme(
             existingRuntime.syncThemeStatus?.();
             const refreshedSlots = existingRuntime.apply();
             if (refreshedSlots) existingRuntime.slots = refreshedSlots;
+            existingRuntime.ensureWallpaperPlayback?.();
             return existingRuntime.slots ?? [];
           }}
           if (existingRuntime?.restoreTheme) {{
@@ -1622,6 +2428,8 @@ fn apply_theme(
             if (existingRuntime?.metricsFrame) cancelAnimationFrame(existingRuntime.metricsFrame);
             if (existingRuntime?.resizeFrame) cancelAnimationFrame(existingRuntime.resizeFrame);
             if (existingRuntime?.leaseTimer) clearInterval(existingRuntime.leaseTimer);
+            if (existingRuntime?.wallpaperPlaybackTimer) clearInterval(existingRuntime.wallpaperPlaybackTimer);
+            existingRuntime?.clearWallpaperControlPersistence?.();
             existingRuntime?.revokeAssets?.();
           }}
           document.querySelectorAll('[data-ct-managed-asset]').forEach(node => node.remove());
@@ -1658,24 +2466,450 @@ fn apply_theme(
             return mount;
           }};
 
-          const createAssetMount = (slot, assetUrl) => {{
+          const createAssetMount = (slot, assetUrl, mediaType = 'image') => {{
             const mount = document.createElement('span');
             mount.dataset.ctMount = slot;
             mount.dataset.ctSlot = slot;
             mount.dataset.ctManagedAsset = '';
             mount.setAttribute('aria-hidden', 'true');
             mount.style.pointerEvents = 'none';
-            const image = document.createElement('img');
-            image.alt = '';
-            image.draggable = false;
-            image.src = assetUrl;
-            mount.appendChild(image);
+            const media = document.createElement(
+              mediaType === 'video' ? 'video'
+                : mediaType === 'web' ? 'iframe'
+                  : mediaType === 'scene' ? 'canvas' : 'img'
+            );
+            if (media instanceof HTMLVideoElement) {{
+              media.autoplay = true;
+              media.loop = true;
+              media.muted = true;
+              media.playsInline = true;
+              media.preload = 'metadata';
+              media.controls = false;
+              media.disablePictureInPicture = true;
+              media.setAttribute('disableRemotePlayback', '');
+            }} else if (media instanceof HTMLIFrameElement) {{
+              media.setAttribute('sandbox', 'allow-scripts');
+              media.setAttribute('referrerpolicy', 'no-referrer');
+              media.setAttribute('allow', '');
+              media.tabIndex = -1;
+              media.addEventListener('load', () => {{ media.dataset.ctWebLoaded = 'true'; }});
+            }} else if (media instanceof HTMLCanvasElement) {{
+              media.dataset.ctSceneSource = assetUrl;
+              media.width = 16;
+              media.height = 9;
+            }} else {{
+              media.alt = '';
+              media.draggable = false;
+            }}
+            if (!(media instanceof HTMLCanvasElement)) media.src = assetUrl;
+            mount.appendChild(media);
+            if (media instanceof HTMLVideoElement) void media.play().catch(() => {{}});
             return mount;
           }};
 
+          const clampControlPercent = (value, fallback) => {{
+            const number = Number(value);
+            return Number.isFinite(number)
+              ? Math.min(100, Math.max(0, Math.round(number)))
+              : fallback;
+          }};
+          let wallpaperControlState = {{
+            wallpaperBrightness: clampControlPercent(config.wallpaper?.brightness, 68),
+            interfaceTransparency: clampControlPercent(
+              config.wallpaper?.interfaceTransparency,
+              32
+            )
+          }};
+          const wallpaperControlBeacons = new Set();
+          let wallpaperControlTimer = 0;
+          let wallpaperPlaybackPaused = false;
+          const wallpaperControlCopy = () => requestedLocale.toLowerCase().startsWith('zh')
+            ? {{
+                title: 'ReTheme 透明度',
+                brightness: '壁纸亮度',
+                transparency: '界面透明度',
+                play: '播放动态壁纸',
+                pause: '暂停动态壁纸',
+                playLabel: '播放',
+                pauseLabel: '暂停',
+                collapse: '收起透明度调节',
+                open: '打开透明度调节'
+              }}
+            : {{
+                title: 'ReTheme opacity',
+                brightness: 'Wallpaper brightness',
+                transparency: 'Interface transparency',
+                play: 'Play live wallpaper',
+                pause: 'Pause live wallpaper',
+                playLabel: 'Play',
+                pauseLabel: 'Pause',
+                collapse: 'Collapse opacity controls',
+                open: 'Open opacity controls'
+              }};
+          const syncWallpaperControlsMount = () => {{
+            const mount = document.querySelector('[data-ct-mount="wallpaper.controls"]');
+            if (!mount) return;
+            const copy = wallpaperControlCopy();
+            const title = mount.querySelector('[data-ct-control-copy="title"]');
+            const brightness = mount.querySelector('[data-ct-control-copy="brightness"]');
+            const transparency = mount.querySelector('[data-ct-control-copy="transparency"]');
+            const collapse = mount.querySelector('.ct-wallpaper-controls__collapse');
+            const open = mount.querySelector('.ct-wallpaper-controls__open');
+            const playback = mount.querySelector('[data-ct-wallpaper-playback]');
+            if (title) title.textContent = copy.title;
+            if (brightness) brightness.textContent = copy.brightness;
+            if (transparency) transparency.textContent = copy.transparency;
+            if (collapse) collapse.setAttribute('aria-label', copy.collapse);
+            if (open) open.setAttribute('aria-label', copy.open);
+            if (playback) {{
+              const actionCopy = wallpaperPlaybackPaused ? copy.play : copy.pause;
+              playback.dataset.ctPaused = String(wallpaperPlaybackPaused);
+              playback.setAttribute('aria-label', actionCopy);
+              playback.setAttribute('title', actionCopy);
+              playback.setAttribute('aria-pressed', String(wallpaperPlaybackPaused));
+              const icon = playback.querySelector('[data-ct-wallpaper-playback-icon]');
+              const label = playback.querySelector('[data-ct-control-copy="playback"]');
+              if (icon) icon.textContent = wallpaperPlaybackPaused ? '▶' : 'Ⅱ';
+              if (label) label.textContent = wallpaperPlaybackPaused
+                ? copy.playLabel
+                : copy.pauseLabel;
+            }}
+            const brightnessInput = mount.querySelector('[data-ct-wallpaper-brightness]');
+            const transparencyInput = mount.querySelector('[data-ct-interface-transparency]');
+            if (brightnessInput) brightnessInput.value = String(wallpaperControlState.wallpaperBrightness);
+            if (transparencyInput) transparencyInput.value = String(wallpaperControlState.interfaceTransparency);
+            const brightnessOutput = mount.querySelector('[data-ct-wallpaper-brightness-output]');
+            const transparencyOutput = mount.querySelector('[data-ct-interface-transparency-output]');
+            if (brightnessOutput) brightnessOutput.textContent = `${{wallpaperControlState.wallpaperBrightness}}%`;
+            if (transparencyOutput) transparencyOutput.textContent = `${{wallpaperControlState.interfaceTransparency}}%`;
+          }};
+          const persistWallpaperControls = () => {{
+            const controlUrl = config.wallpaper?.controlUrl;
+            if (!controlUrl) return;
+            const url = new URL(controlUrl);
+            url.searchParams.set(
+              'wallpaperBrightness',
+              String(wallpaperControlState.wallpaperBrightness)
+            );
+            url.searchParams.set(
+              'interfaceTransparency',
+              String(wallpaperControlState.interfaceTransparency)
+            );
+            url.searchParams.set('playbackPaused', String(wallpaperPlaybackPaused));
+            const beacon = new Image();
+            wallpaperControlBeacons.add(beacon);
+            beacon.onload = beacon.onerror = () => wallpaperControlBeacons.delete(beacon);
+            beacon.src = url.href;
+          }};
+          const setWallpaperControls = (next = {{}}, persist = false) => {{
+            wallpaperControlState = {{
+              wallpaperBrightness: clampControlPercent(
+                next.wallpaperBrightness,
+                wallpaperControlState.wallpaperBrightness
+              ),
+              interfaceTransparency: clampControlPercent(
+                next.interfaceTransparency,
+                wallpaperControlState.interfaceTransparency
+              )
+            }};
+            const root = document.documentElement;
+            root?.style.setProperty(
+              '--ct-wallpaper-brightness',
+              (wallpaperControlState.wallpaperBrightness / 100).toFixed(2)
+            );
+            root?.style.setProperty(
+              '--ct-interface-opacity',
+              ((100 - wallpaperControlState.interfaceTransparency) / 100).toFixed(2)
+            );
+            syncWallpaperControlsMount();
+            if (persist && config.wallpaper?.controlUrl) {{
+              if (wallpaperControlTimer) clearTimeout(wallpaperControlTimer);
+              wallpaperControlTimer = setTimeout(() => {{
+                wallpaperControlTimer = 0;
+                persistWallpaperControls();
+              }}, 120);
+            }}
+            return {{ ...wallpaperControlState }};
+          }};
+          const clearWallpaperControlPersistence = () => {{
+            if (wallpaperControlTimer) clearTimeout(wallpaperControlTimer);
+            wallpaperControlTimer = 0;
+            wallpaperControlBeacons.clear();
+            stopSceneFrameLoop();
+          }};
+          const setWallpaperPlaybackPaused = paused => {{
+            wallpaperPlaybackPaused = Boolean(paused);
+            const video = document.querySelector(
+              '[data-ct-mount="app.background"] video'
+            );
+            if (video instanceof HTMLVideoElement) {{
+              if (wallpaperPlaybackPaused) {{
+                video.pause();
+              }} else {{
+                if (video.ended) video.currentTime = 0;
+                void video.play()
+                  .then(() => syncWallpaperControlsMount())
+                  .catch(() => syncWallpaperControlsMount());
+              }}
+            }}
+            if (config.wallpaper?.kind === 'scene') {{
+              if (!wallpaperPlaybackPaused) startSceneFrameLoop();
+              persistWallpaperControls();
+            }}
+            syncWallpaperControlsMount();
+            return {{
+              paused: wallpaperPlaybackPaused,
+              videoPaused: video instanceof HTMLVideoElement ? video.paused : true
+            }};
+          }};
+          const toggleWallpaperPlayback = () =>
+            setWallpaperPlaybackPaused(!wallpaperPlaybackPaused);
+          const ensureWallpaperControls = root => {{
+            if (!['video', 'scene'].includes(config.wallpaper?.kind)) return null;
+            let mount = document.querySelector('[data-ct-mount="wallpaper.controls"]');
+            if (!mount) {{
+              mount = createMount('wallpaper.controls', 'ct-wallpaper-controls');
+              mount.innerHTML = `
+                <div class="ct-wallpaper-controls__panel">
+                  <div class="ct-wallpaper-controls__header">
+                    <strong data-ct-control-copy="title"></strong>
+                    <button type="button" class="ct-wallpaper-controls__collapse">−</button>
+                  </div>
+                  <label class="ct-wallpaper-controls__field">
+                    <span class="ct-wallpaper-controls__label"><span data-ct-control-copy="brightness"></span><output data-ct-wallpaper-brightness-output></output></span>
+                    <input class="ct-wallpaper-controls__range" type="range" min="0" max="100" step="1" data-ct-wallpaper-brightness>
+                  </label>
+                  <label class="ct-wallpaper-controls__field">
+                    <span class="ct-wallpaper-controls__label"><span data-ct-control-copy="transparency"></span><output data-ct-interface-transparency-output></output></span>
+                    <input class="ct-wallpaper-controls__range" type="range" min="0" max="100" step="1" data-ct-interface-transparency>
+                  </label>
+                  <button type="button" class="ct-wallpaper-controls__playback" data-ct-wallpaper-playback aria-pressed="false">
+                    <span class="ct-wallpaper-controls__playback-icon" data-ct-wallpaper-playback-icon aria-hidden="true">Ⅱ</span>
+                    <span data-ct-control-copy="playback"></span>
+                  </button>
+                </div>
+                <button type="button" class="ct-wallpaper-controls__open">RT</button>`;
+              mount.querySelector('.ct-wallpaper-controls__collapse')?.addEventListener('click', () => {{
+                mount.classList.add('ct-wallpaper-controls--collapsed');
+              }});
+              mount.querySelector('.ct-wallpaper-controls__open')?.addEventListener('click', () => {{
+                mount.classList.remove('ct-wallpaper-controls--collapsed');
+              }});
+              mount.querySelector('[data-ct-wallpaper-brightness]')?.addEventListener(
+                'input',
+                event => setWallpaperControls({{
+                  wallpaperBrightness: event.currentTarget.value
+                }}, true)
+              );
+              mount.querySelector('[data-ct-interface-transparency]')?.addEventListener(
+                'input',
+                event => setWallpaperControls({{
+                  interfaceTransparency: event.currentTarget.value
+                }}, true)
+              );
+              mount.querySelector('[data-ct-wallpaper-playback]')?.addEventListener(
+                'click',
+                toggleWallpaperPlayback
+              );
+              root.appendChild(mount);
+            }} else if (mount.parentElement !== root) {{
+              root.appendChild(mount);
+            }}
+            setWallpaperControls(wallpaperControlState, false);
+            return mount;
+          }};
+
+          const configuredAssets = [...(config.assets ?? [])];
+          if (['video', 'scene', 'web'].includes(config.wallpaper?.kind) && config.wallpaper.assetUrl) {{
+            configuredAssets.push({{
+              slot: 'app.background',
+              assetUrl: config.wallpaper.assetUrl,
+              mediaType: config.wallpaper.kind,
+            }});
+          }}
           const assetsBySlot = new Map(
-            (config.assets ?? []).map(asset => [asset.slot, asset])
+            configuredAssets.map(asset => [asset.slot, asset])
           );
+
+          let sceneFrameDecodeInFlight = false;
+          let sceneFramePending = null;
+          let sceneFrameStopped = false;
+          let sceneFrameSequence = 0;
+          const sceneFrameStats = {{
+            decodedFrames: 0,
+            droppedFrames: 0,
+            failedRequests: 0,
+            receivedFrames: 0,
+            startedAt: 0,
+            lastFrameDurationMs: 0,
+            lastError: null
+          }};
+          const renderSceneFrame = async frame => {{
+            if (sceneFrameStopped || sceneFrameDecodeInFlight || assetsRevoked) return;
+            const {{ payload, sequence }} = frame;
+            const canvas = document.querySelector(
+              '[data-ct-mount="app.background"] canvas[data-ct-scene-source]'
+            );
+            if (!(canvas instanceof HTMLCanvasElement)) return;
+            sceneFrameDecodeInFlight = true;
+            const started = performance.now();
+            try {{
+              const bitmap = await createImageBitmap(
+                new Blob([payload], {{ type: 'image/jpeg' }})
+              );
+              if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {{
+                canvas.width = bitmap.width;
+                canvas.height = bitmap.height;
+              }}
+              const bitmapContext = canvas.getContext('bitmaprenderer');
+              if (bitmapContext) {{
+                bitmapContext.transferFromImageBitmap(bitmap);
+              }} else {{
+                const context = canvas.getContext('2d', {{ alpha: false }});
+                context?.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+                bitmap.close();
+              }}
+              if (!sceneFrameStats.startedAt) sceneFrameStats.startedAt = performance.now();
+              sceneFrameStats.decodedFrames += 1;
+              sceneFrameStats.lastError = null;
+              sceneFrameSequence = Number.isFinite(Number(sequence))
+                ? Number(sequence)
+                : sceneFrameSequence + 1;
+              canvas.dataset.ctSceneReady = 'true';
+              canvas.dataset.ctSceneFrame = String(sceneFrameSequence);
+            }} catch (error) {{
+              sceneFrameStats.failedRequests += 1;
+              sceneFrameStats.lastError = String(error);
+            }} finally {{
+              sceneFrameDecodeInFlight = false;
+              sceneFrameStats.lastFrameDurationMs = performance.now() - started;
+              const pending = sceneFramePending;
+              sceneFramePending = null;
+              if (pending && !wallpaperPlaybackPaused && !sceneFrameStopped) {{
+                void renderSceneFrame(pending);
+              }}
+            }}
+          }};
+          const queueSceneFrame = (payload, sequence) => {{
+            if (wallpaperPlaybackPaused || sceneFrameStopped || assetsRevoked) return;
+            const frame = {{ payload, sequence }};
+            if (sceneFrameDecodeInFlight) {{
+              sceneFramePending = frame;
+              sceneFrameStats.droppedFrames += 1;
+              return;
+            }}
+            void renderSceneFrame(frame);
+          }};
+          const pushSceneFrame = (encodedFrame, sequence) => {{
+            if (typeof encodedFrame !== 'string' || !encodedFrame) return false;
+            const binary = atob(encodedFrame);
+            const payload = new Uint8Array(binary.length);
+            for (let index = 0; index < binary.length; index += 1) {{
+              payload[index] = binary.charCodeAt(index);
+            }}
+            sceneFrameStats.receivedFrames += 1;
+            queueSceneFrame(payload, sequence);
+            return true;
+          }};
+          startSceneFrameLoop = () => {{
+            if (config.wallpaper?.kind !== 'scene' || assetsRevoked) return false;
+            sceneFrameStopped = false;
+            return true;
+          }};
+          stopSceneFrameLoop = () => {{
+            sceneFrameStopped = true;
+            sceneFramePending = null;
+          }};
+          const getScenePlaybackStats = () => {{
+            const elapsed = sceneFrameStats.startedAt
+              ? Math.max(0.001, (performance.now() - sceneFrameStats.startedAt) / 1000)
+              : 0;
+            return {{
+              ...sceneFrameStats,
+              framesPerSecond: elapsed ? sceneFrameStats.decodedFrames / elapsed : 0,
+              sequence: sceneFrameSequence,
+              inFlight: sceneFrameDecodeInFlight,
+              stopped: sceneFrameStopped
+            }};
+          }};
+
+          const ensureWallpaperPlayback = () => {{
+            if (config.wallpaper?.kind === 'scene') {{
+              startSceneFrameLoop();
+              return document.querySelector(
+                '[data-ct-mount="app.background"] canvas[data-ct-scene-ready="true"]'
+              ) instanceof HTMLCanvasElement;
+            }}
+            if (config.wallpaper?.kind === 'web') {{
+              return document.querySelector(
+                '[data-ct-mount="app.background"] iframe[sandbox="allow-scripts"]'
+              ) instanceof HTMLIFrameElement;
+            }}
+            if (!localWallpaperObjectUrl) return false;
+            const video = document.querySelector(
+              '[data-ct-mount="app.background"] video'
+            );
+            if (!(video instanceof HTMLVideoElement)) return false;
+            if (video.src !== localWallpaperObjectUrl) {{
+              video.src = localWallpaperObjectUrl;
+              video.load();
+            }}
+            if (wallpaperPlaybackPaused) {{
+              if (!video.paused) video.pause();
+              syncWallpaperControlsMount();
+              return true;
+            }}
+            if (video.ended) video.currentTime = 0;
+            if (video.paused) void video.play().catch(() => {{}});
+            syncWallpaperControlsMount();
+            return true;
+          }};
+
+          const setLocalWallpaperFile = file => {{
+            if (!(file instanceof File)) return false;
+            const asset = assetsBySlot.get('app.background');
+            if (!asset || asset.mediaType !== 'video') return false;
+            const previousWallpaperObjectUrl = localWallpaperObjectUrl;
+            localWallpaperObjectUrl = URL.createObjectURL(file);
+            asset.assetUrl = localWallpaperObjectUrl;
+            delete asset.lightAssetUrl;
+            delete asset.darkAssetUrl;
+            let media = document.querySelector('[data-ct-mount="app.background"] video');
+            let refreshedSlots = null;
+            if (!(media instanceof HTMLVideoElement)) {{
+              refreshedSlots = apply();
+              media = document.querySelector('[data-ct-mount="app.background"] video');
+            }}
+            if (!(media instanceof HTMLVideoElement)) return false;
+            if (previousWallpaperObjectUrl) {{
+              let released = false;
+              const releasePrevious = () => {{
+                if (released) return;
+                released = true;
+                URL.revokeObjectURL(previousWallpaperObjectUrl);
+              }};
+              media.addEventListener('load', releasePrevious, {{ once: true }});
+              media.addEventListener('error', releasePrevious, {{ once: true }});
+              setTimeout(releasePrevious, 1000);
+            }}
+            if (media.src !== localWallpaperObjectUrl) media.src = localWallpaperObjectUrl;
+            media.load();
+            if (wallpaperPlaybackPaused) media.pause();
+            else void media.play().catch(() => {{}});
+            syncWallpaperControlsMount();
+            const runtime = window[runtimeKey];
+            if (runtime?.sessionId === sessionId && refreshedSlots) {{
+              runtime.slots = refreshedSlots;
+              runtime.ensureWallpaperPlayback?.();
+              if (!runtime.wallpaperPlaybackTimer) {{
+                runtime.wallpaperPlaybackTimer = setInterval(
+                  () => runtime.ensureWallpaperPlayback?.(),
+                  1000
+                );
+              }}
+            }}
+            return media.src === localWallpaperObjectUrl;
+          }};
 
           const assetUrlForScheme = asset => {{
             if (!asset) return null;
@@ -1690,8 +2924,10 @@ fn apply_theme(
               .forEach(mount => {{
                 const asset = assetsBySlot.get(mount.getAttribute('data-ct-mount'));
                 const assetUrl = assetUrlForScheme(asset);
-                const image = mount.querySelector('img');
-                if (image && assetUrl && image.src !== assetUrl) image.src = assetUrl;
+                const media = mount.querySelector('img, video, iframe');
+                if (media && assetUrl && media.src !== assetUrl) {{
+                  media.src = assetUrl;
+                }}
               }});
           }};
 
@@ -1704,7 +2940,7 @@ fn apply_theme(
               child => child.getAttribute('data-ct-mount') === slot
             );
             if (!mount) {{
-              mount = createAssetMount(slot, assetUrl);
+              mount = createAssetMount(slot, assetUrl, asset.mediaType);
               if (['app.background', 'main.background', 'main.overlay', 'main.frame', 'sidebar.frame'].includes(slot)) {{
                 mount.style.position = 'absolute';
                 mount.style.inset = '0';
@@ -1713,8 +2949,12 @@ fn apply_theme(
               else parent.appendChild(mount);
             }} else {{
               mount.dataset.ctSlot = slot;
-              const image = mount.querySelector('img');
-              if (image && image.src !== assetUrl) image.src = assetUrl;
+              const media = mount.querySelector('img, video, iframe, canvas');
+              if (media instanceof HTMLCanvasElement) {{
+                media.dataset.ctSceneSource = assetUrl;
+              }} else if (media && media.src !== assetUrl) {{
+                media.src = assetUrl;
+              }}
             }}
             return mount;
           }};
@@ -2942,7 +4182,7 @@ fn apply_theme(
             const root = document.getElementById('root');
             if (!root || !document.documentElement) return null;
             if (!runtimeInstalled
-              && !adapter.probes.every(selector => document.querySelector(selector))) return null;
+              && !adapter.probes.some(selector => document.querySelector(selector))) return null;
             syncColorScheme();
             syncLocaleConfig();
             let style = document.getElementById('codex-theme-runtime-style');
@@ -2973,6 +4213,7 @@ fn apply_theme(
             if (syncAssetMount(root, 'app.background', 'prepend')) {{
               slots.push('app.background');
             }}
+            if (ensureWallpaperControls(root)) slots.push('wallpaper.controls');
             document.querySelectorAll('[data-ct-native-titlebar]')
               .forEach(node => node.removeAttribute('data-ct-native-titlebar'));
             const nativeTitlebars = [
@@ -2996,13 +4237,15 @@ fn apply_theme(
                 panel.parentElement?.setAttribute('data-ct-workspace-panel-region', '');
               }});
             }}
-            if (adapter.selectors.mainContentFrame) {{
-              markSlot(
-                document.querySelectorAll(adapter.selectors.mainContentFrame),
-                'main.content.frame',
-                slots
-              );
-            }}
+            const mainContentFrames = [
+              ...(adapter.selectors.mainContentFrame
+                ? document.querySelectorAll(adapter.selectors.mainContentFrame)
+                : []),
+              ...document.querySelectorAll(
+                '[class^="_MainContentFrame_"], [class*=" _MainContentFrame_"]'
+              )
+            ];
+            markSlot([...new Set(mainContentFrames)], 'main.content.frame', slots);
             const editors = [...document.querySelectorAll(adapter.selectors.composer)];
             const editor = editors.find(isVisible) ?? editors[0] ?? null;
             document.querySelectorAll('[data-ct-composer-layout]').forEach(node => {{
@@ -3359,30 +4602,79 @@ fn apply_theme(
                 composer.setAttribute('data-ct-slot', 'composer');
                 slots.push('composer');
               }}
-              let composerSticky = composer?.parentElement ?? null;
-              while (
-                composerSticky
-                && composerSticky !== appMain
-                && getComputedStyle(composerSticky).position !== 'sticky'
-              ) {{
-                composerSticky = composerSticky.parentElement;
+              const composerRect = composer?.getBoundingClientRect();
+              const appMainRect = appMain?.getBoundingClientRect();
+              const bottomEdge = Math.min(
+                window.innerHeight,
+                appMainRect?.bottom ?? window.innerHeight
+              );
+              let composerRegion = [...document.querySelectorAll(
+                '[data-ct-slot="composer.region"]'
+              )].find(node => node.contains(composerRoot) && isVisible(node)) ?? null;
+              if (!composerRegion && composer && composerRect) {{
+                let candidate = composer.parentElement;
+                while (candidate && candidate !== appMain) {{
+                  const rect = candidate.getBoundingClientRect();
+                  const style = getComputedStyle(candidate);
+                  const nearBottom = Math.abs(rect.bottom - bottomEdge) <= 8;
+                  const wrapsComposer = rect.width >= composerRect.width + 32
+                    && rect.height >= composerRect.height
+                    && rect.height <= Math.max(240, composerRect.height * 3.5);
+                  const positioned = ['relative', 'absolute', 'fixed', 'sticky']
+                    .includes(style.position);
+                  if (nearBottom && wrapsComposer && positioned) {{
+                    composerRegion = candidate;
+                    break;
+                  }}
+                  candidate = candidate.parentElement;
+                }}
               }}
-              const backdrop = document.documentElement.dataset.ctView === 'conversation'
-                && composerSticky
-                && getComputedStyle(composerSticky).position === 'sticky'
-                ? [...composerSticky.children].find(node => {{
-                    if (node.contains(composer)) return false;
+              if (composerRegion) {{
+                composerRegion.setAttribute('data-ct-slot', 'composer.region');
+                slots.push('composer.region');
+              }}
+              const conversationScope = [...document.querySelectorAll(
+                adapter.selectors.conversation
+              )].find(isVisible);
+              const backdropScopes = [composerRegion, conversationScope].filter(Boolean);
+              const backdrops = composerRegion && composerRect
+                ? [...new Set(backdropScopes.flatMap(
+                    scope => [...scope.querySelectorAll('*')]
+                  ))].filter(node => {{
+                    if (node === composer || node.contains(composer) || composer?.contains(node)) {{
+                      return false;
+                    }}
+                    const rect = node.getBoundingClientRect();
+                    const regionRect = composerRegion.getBoundingClientRect();
                     const style = getComputedStyle(node);
-                    return style.position === 'absolute'
-                      && style.pointerEvents === 'none'
-                      && [node, ...node.querySelectorAll('*')].some(child =>
-                        getComputedStyle(child).backgroundImage.includes('gradient')
-                      );
+                    const overlapsRegion = rect.bottom >= regionRect.top - 12
+                      && rect.top <= regionRect.bottom + 12;
+                    const spansComposer = rect.width >= Math.max(240, composerRect.width * 0.75);
+                    const shallowLayer = rect.height > 0
+                      && rect.height <= Math.max(260, regionRect.height * 2.5);
+                    const isPassiveLayer = style.pointerEvents === 'none'
+                      && ['absolute', 'fixed', 'sticky'].includes(style.position);
+                    const hasBackdropVisual = [node, ...node.querySelectorAll('*')]
+                      .some(child => {{
+                        const childStyle = getComputedStyle(child);
+                        const background = childStyle.backgroundColor;
+                        return childStyle.backgroundImage.includes('gradient')
+                          || (background !== 'transparent'
+                            && background !== 'rgba(0, 0, 0, 0)')
+                          || childStyle.boxShadow !== 'none'
+                          || childStyle.filter !== 'none'
+                          || childStyle.backdropFilter !== 'none'
+                          || childStyle.getPropertyValue('-webkit-backdrop-filter') !== 'none';
+                      }});
+                    return overlapsRegion
+                      && spansComposer
+                      && shallowLayer
+                      && isPassiveLayer
+                      && hasBackdropVisual;
                   }})
-                : null;
-              if (backdrop) {{
-                backdrop.setAttribute('data-ct-slot', 'composer.backdrop');
-                slots.push('composer.backdrop');
+                : [];
+              if (backdrops.length) {{
+                markSlot(backdrops, 'composer.backdrop', slots);
               }}
               if (editorSurface) {{
                 editorSurface.setAttribute('data-ct-slot', 'composer.editor');
@@ -3706,6 +4998,8 @@ fn apply_theme(
           }};
           const runtime = {{
             sessionId,
+            wallpaperKind: config.wallpaper?.kind ?? null,
+            sceneCaptureMode: null,
             slots,
             revokeAssets,
             hardExpiresAt,
@@ -3719,6 +5013,22 @@ fn apply_theme(
             composerLayoutObserver,
             colorSchemeMedia,
             syncColorScheme,
+            ensureWallpaperPlayback,
+            setLocalWallpaperFile,
+            setWallpaperControls,
+            setWallpaperPlaybackPaused,
+            getScenePlaybackStats,
+            pushSceneFrame,
+            startSceneFrameLoop,
+            stopSceneFrameLoop,
+            getWallpaperPlaybackState: () => ({{
+              paused: wallpaperPlaybackPaused,
+              videoPaused: document.querySelector(
+                '[data-ct-mount="app.background"] video'
+              )?.paused ?? true
+            }}),
+            clearWallpaperControlPersistence,
+            wallpaperPlaybackTimer: 0,
             frame: 0,
             homeFrame: 0,
             contentFrame: 0,
@@ -3975,15 +5285,26 @@ fn apply_theme(
           window[runtimeKey] = runtime;
           installPageLease(runtimeKey, runtime, pageLeaseMilliseconds);
           scheduleApply();
+          runtime.ensureWallpaperPlayback?.();
           return slots;
         }})()"#
     );
 
+    let slots = apply_theme_expression(websocket_url, &expression)?;
+    Ok((slots, expression))
+}
+
+fn apply_theme_expression(
+    websocket_url: &str,
+    expression: &str,
+) -> Result<Vec<String>, CodexError> {
+    let mut socket = connect_theme_channel(websocket_url)?;
+    set_page_csp_bypass(&mut socket, 1, true)?;
     let started = Instant::now();
     let mut command_id = 2;
     let mut last_slots = Vec::new();
-    let slots = loop {
-        let value = evaluate_value(&mut socket, command_id, &expression)?;
+    let result = loop {
+        let value = evaluate_value(&mut socket, command_id, expression)?;
         if let Some(slots) = value.as_array() {
             let slots: Vec<String> = slots
                 .iter()
@@ -3992,12 +5313,12 @@ fn apply_theme(
                 .collect();
             last_slots.clone_from(&slots);
             if startup_slots_ready(&slots) {
-                break slots;
+                break Ok(slots);
             }
         }
         if started.elapsed() >= STARTUP_TIMEOUT {
             let missing = missing_startup_slots(&last_slots);
-            return Err(CodexError(format!(
+            break Err(CodexError(format!(
                 "等待 ChatGPT 主题界面就绪超时，缺少核心区域：{}",
                 missing.join(", ")
             )));
@@ -4006,7 +5327,7 @@ fn apply_theme(
         thread::sleep(Duration::from_millis(100));
     };
     let _ = socket.close(None);
-    Ok(slots)
+    result
 }
 
 fn startup_slots_ready(slots: &[String]) -> bool {
@@ -4015,6 +5336,13 @@ fn startup_slots_ready(slots: &[String]) -> bool {
 
 fn missing_startup_slots(slots: &[String]) -> Vec<&'static str> {
     let view = slots.iter().find_map(|slot| slot.strip_prefix("view:"));
+    if view == Some("other") {
+        return REQUIRED_OTHER_STARTUP_SLOTS
+            .iter()
+            .copied()
+            .filter(|required| !slots.iter().any(|slot| slot == required))
+            .collect();
+    }
     let view_slots = match view {
         Some("home") => REQUIRED_HOME_STARTUP_SLOTS,
         Some("home-compact") => REQUIRED_COMPACT_HOME_STARTUP_SLOTS,
@@ -4056,6 +5384,8 @@ fn remove_theme(websocket_url: &str) -> Result<bool, CodexError> {
       if (runtime?.contentFrame) cancelAnimationFrame(runtime.contentFrame);
       if (runtime?.metricsFrame) cancelAnimationFrame(runtime.metricsFrame);
       if (runtime?.resizeFrame) cancelAnimationFrame(runtime.resizeFrame);
+      if (runtime?.wallpaperPlaybackTimer) clearInterval(runtime.wallpaperPlaybackTimer);
+      runtime?.clearWallpaperControlPersistence?.();
       delete window.__codexThemeRuntime;
       document.querySelectorAll('[data-ct-home-prompt-native]').forEach(node => {
         const display = node.getAttribute('data-ct-home-prompt-display');
@@ -4072,6 +5402,8 @@ fn remove_theme(websocket_url: &str) -> Result<bool, CodexError> {
       document.documentElement?.removeAttribute('data-ct-color-scheme');
       document.documentElement?.style.removeProperty('--ct-home-card-count');
       document.documentElement?.style.removeProperty('--ct-titlebar-safe-top');
+      document.documentElement?.style.removeProperty('--ct-wallpaper-brightness');
+      document.documentElement?.style.removeProperty('--ct-interface-opacity');
       document.querySelectorAll('[data-ct-slot="conversation.stage"]').forEach(node => {
         node.style.removeProperty('--ct-conversation-banner-clearance');
         node.style.removeProperty('--ct-conversation-summary-width');
@@ -4138,16 +5470,64 @@ fn wait_for_codex_target(
     process: &mut IsolatedProcess,
 ) -> Result<DevToolsTarget, CodexError> {
     let started = Instant::now();
+    let mut stable_target = None::<(String, Instant)>;
     while started.elapsed() < STARTUP_TIMEOUT {
         if process.has_exited()? {
             return Err(CodexError("隔离 ChatGPT 提前退出".into()));
         }
         if let Ok(Some(target)) = find_codex_target(port, Duration::from_millis(500)) {
-            return Ok(target);
+            // `/json/list` 会在新版 ChatGPT 的页面仍处于 about:blank 时提前把
+            // target URL 报成 app://-/index.html。此时立刻注入，导航会销毁执行
+            // 上下文，CDP 命令可能一直等到套接字超时。必须以页面内部报告的
+            // location/readyState 为准，并要求同一个 target 短暂稳定后再使用。
+            if codex_target_document_ready(&target.web_socket_debugger_url).unwrap_or(false) {
+                match &stable_target {
+                    Some((url, since))
+                        if url == &target.web_socket_debugger_url
+                            && since.elapsed() >= TARGET_READY_STABILITY =>
+                    {
+                        return Ok(target);
+                    }
+                    Some((url, _)) if url == &target.web_socket_debugger_url => {}
+                    _ => {
+                        stable_target =
+                            Some((target.web_socket_debugger_url.clone(), Instant::now()));
+                    }
+                }
+            } else {
+                stable_target = None;
+            }
         }
         thread::sleep(Duration::from_millis(100));
     }
-    Err(CodexError("等待通过身份验证的 ChatGPT 页面目标超时".into()))
+    Err(CodexError("等待稳定的 ChatGPT 页面目标超时".into()))
+}
+
+fn codex_target_document_ready(websocket_url: &str) -> Result<bool, CodexError> {
+    let mut socket = connect_theme_channel_with_timeout(websocket_url, TARGET_READY_PROBE_TIMEOUT)?;
+    let value = evaluate_value(
+        &mut socket,
+        1,
+        r#"(() => ({
+          url: location.href,
+          readyState: document.readyState,
+          hasDocument: Boolean(document.documentElement && document.body)
+        }))()"#,
+    );
+    let _ = socket.close(None);
+    value.map(|value| codex_target_document_ready_value(&value))
+}
+
+fn codex_target_document_ready_value(value: &Value) -> bool {
+    value.get("url").and_then(Value::as_str) == Some("app://-/index.html")
+        && matches!(
+            value.get("readyState").and_then(Value::as_str),
+            Some("interactive") | Some("complete")
+        )
+        && value
+            .get("hasDocument")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
 }
 
 fn find_codex_target(port: u16, timeout: Duration) -> Result<Option<DevToolsTarget>, CodexError> {
@@ -4428,6 +5808,13 @@ fn get_json_with_timeout<T: for<'de> Deserialize<'de>>(
 }
 
 fn connect_theme_channel(websocket_url: &str) -> Result<WebSocket<TcpStream>, CodexError> {
+    connect_theme_channel_with_timeout(websocket_url, THEME_CHANNEL_IO_TIMEOUT)
+}
+
+fn connect_theme_channel_with_timeout(
+    websocket_url: &str,
+    io_timeout: Duration,
+) -> Result<WebSocket<TcpStream>, CodexError> {
     let uri = websocket_url
         .parse::<tungstenite::http::Uri>()
         .map_err(|error| CodexError(format!("本地主题通道地址无效：{error}")))?;
@@ -4446,13 +5833,13 @@ fn connect_theme_channel(websocket_url: &str) -> Result<WebSocket<TcpStream>, Co
         return Err(CodexError("本地主题通道必须使用回环地址".into()));
     }
     let address = SocketAddr::new(ip, uri.port_u16().unwrap_or(80));
-    let stream = TcpStream::connect_timeout(&address, THEME_CHANNEL_IO_TIMEOUT)
+    let stream = TcpStream::connect_timeout(&address, io_timeout)
         .map_err(|error| CodexError(format!("无法连接本地主题通道：{error}")))?;
     stream
-        .set_read_timeout(Some(THEME_CHANNEL_IO_TIMEOUT))
+        .set_read_timeout(Some(io_timeout))
         .map_err(|error| CodexError(format!("无法配置本地主题通道读取超时：{error}")))?;
     stream
-        .set_write_timeout(Some(THEME_CHANNEL_IO_TIMEOUT))
+        .set_write_timeout(Some(io_timeout))
         .map_err(|error| CodexError(format!("无法配置本地主题通道写入超时：{error}")))?;
     stream
         .set_nodelay(true)
@@ -4496,6 +5883,41 @@ fn test_injection(websocket_url: &str) -> Result<(bool, bool), CodexError> {
     let removed = evaluate(&mut socket, command_id + 1, remove_expression)?;
     let _ = socket.close(None);
     Ok((applied, removed))
+}
+
+fn test_adapter_probes(
+    websocket_url: &str,
+    adapter: &compatibility::CodexAdapter,
+) -> Result<Vec<String>, CodexError> {
+    let mut selectors = adapter.probes.clone();
+    selectors.push(adapter.selectors.main.clone());
+    selectors.sort();
+    selectors.dedup();
+    let encoded = serde_json::to_string(&selectors)
+        .map_err(|error| CodexError(format!("无法编码兼容探针：{error}")))?;
+    let expression = format!(
+        "(() => {{ const selectors = {encoded}; return selectors.filter(selector => !document.querySelector(selector)); }})()"
+    );
+    let mut socket = connect_theme_channel(websocket_url)?;
+    let started = Instant::now();
+    let mut command_id = 100;
+    let missing = loop {
+        let value = evaluate_value(&mut socket, command_id, &expression)?;
+        let missing = value
+            .as_array()
+            .ok_or_else(|| CodexError("兼容探针没有返回列表".into()))?
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if missing.is_empty() || started.elapsed() >= STARTUP_TIMEOUT {
+            break missing;
+        }
+        command_id += 1;
+        thread::sleep(Duration::from_millis(100));
+    };
+    let _ = socket.close(None);
+    Ok(missing)
 }
 
 fn evaluate<S>(
@@ -4606,6 +6028,45 @@ where
     }
 }
 
+fn send_cdp_command<S>(
+    socket: &mut tungstenite::WebSocket<S>,
+    id: u64,
+    method: &str,
+    params: Value,
+) -> Result<Value, CodexError>
+where
+    S: Read + Write,
+{
+    socket
+        .send(Message::Text(
+            json!({ "id": id, "method": method, "params": params })
+                .to_string()
+                .into(),
+        ))
+        .map_err(|error| CodexError(format!("发送本地主题通道命令失败：{error}")))?;
+    loop {
+        let message = socket
+            .read()
+            .map_err(|error| CodexError(format!("读取本地主题通道响应失败：{error}")))?;
+        if !message.is_text() {
+            continue;
+        }
+        let response: Value = serde_json::from_str(
+            message
+                .to_text()
+                .map_err(|error| CodexError(format!("本地主题通道文本响应无效：{error}")))?,
+        )
+        .map_err(|error| CodexError(format!("本地主题通道响应数据无效：{error}")))?;
+        if response.get("id").and_then(Value::as_u64) != Some(id) {
+            continue;
+        }
+        if let Some(error) = response.get("error") {
+            return Err(CodexError(format!("本地主题通道命令返回错误：{error}")));
+        }
+        return Ok(response.get("result").cloned().unwrap_or(Value::Null));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4636,7 +6097,11 @@ mod tests {
             id: 1,
             instance,
             _asset_server: None,
+            _scene_frame_pump: None,
             port,
+            apply_expression: String::new(),
+            local_wallpaper_file: None,
+            wallpaper_controls: None,
             deadline: None,
             target_missing_since: None,
             report: test_report(port),
@@ -4883,6 +6348,21 @@ mod tests {
     }
 
     #[test]
+    fn local_wallpaper_media_uses_a_revocable_file_handle_and_playback_guard() {
+        let source = include_str!("codex.rs");
+
+        assert!(source.contains("DOM.setFileInputFiles"));
+        assert!(source.contains("asset.mediaType !== 'video'"));
+        assert!(source.contains("wallpaperKind: config.wallpaper?.kind"));
+        assert!(source.contains("URL.createObjectURL(file)"));
+        assert!(source.contains("URL.revokeObjectURL(localWallpaperObjectUrl)"));
+        assert!(source.contains("wallpaperPlaybackTimer = setInterval("));
+        assert!(source.contains("clearInterval(runtime.wallpaperPlaybackTimer)"));
+        assert!(!source.contains(&["--disable-web", "-security"].concat()));
+        assert!(!source.contains(&["--allow-running-insecure", "-content"].concat()));
+    }
+
+    #[test]
     fn card_background_is_a_non_interactive_inner_layer() {
         assert!(PLATFORM_RUNTIME_CSS.contains("[data-ct-slot=\"home.card\"]"));
         assert!(PLATFORM_RUNTIME_CSS.contains("[data-ct-mount=\"home.card.background\"]",));
@@ -5026,12 +6506,29 @@ mod tests {
     #[test]
     fn conversation_composer_backdrop_is_removed_without_hiding_composer() {
         let source = include_str!("codex.rs");
+        let runtime_source = source
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or(source);
 
+        assert!(PLATFORM_RUNTIME_CSS.contains("[data-ct-slot=\"composer.region\"]"));
+        assert!(PLATFORM_RUNTIME_CSS.contains("background: transparent !important"));
+        assert!(PLATFORM_RUNTIME_CSS.contains("backdrop-filter: none !important"));
         assert!(PLATFORM_RUNTIME_CSS.contains("[data-ct-slot=\"composer.backdrop\"]"));
         assert!(PLATFORM_RUNTIME_CSS.contains("display: none !important"));
-        assert!(source.contains("getComputedStyle(composerSticky).position === 'sticky'"));
+        assert!(source.contains("Math.abs(rect.bottom - bottomEdge) <= 8"));
+        assert!(source.contains("['relative', 'absolute', 'fixed', 'sticky']"));
         assert!(source.contains("style.pointerEvents === 'none'"));
         assert!(source.contains("backgroundImage.includes('gradient')"));
+        assert!(source.contains(
+            "const backdropScopes = [composerRegion, conversationScope].filter(Boolean);"
+        ));
+        assert!(!runtime_source.contains(
+            "const backdropScopes = [composerRegion, visibleConversation].filter(Boolean);"
+        ));
+        assert!(source.contains("scope => [...scope.querySelectorAll('*')]"));
+        assert!(source.contains("rect.bottom >= regionRect.top - 12"));
+        assert!(source.contains("composerRect.width * 0.75"));
     }
 
     #[test]
@@ -5055,9 +6552,13 @@ mod tests {
 
     #[test]
     fn main_content_frame_has_no_native_separator() {
+        let source = include_str!("codex.rs");
+
         assert!(PLATFORM_RUNTIME_CSS.contains("[data-ct-slot=\"main.content.frame\"]"));
         assert!(PLATFORM_RUNTIME_CSS.contains("border: 0 !important"));
         assert!(PLATFORM_RUNTIME_CSS.contains("box-shadow: none !important"));
+        assert!(source.contains("[class^=\"_MainContentFrame_\"]"));
+        assert!(source.contains("markSlot([...new Set(mainContentFrames)]"));
     }
 
     #[test]
@@ -5099,7 +6600,7 @@ mod tests {
         let source = include_str!("codex.rs");
 
         assert!(source.contains("let runtimeInstalled = false"));
-        assert!(source.contains("if (!runtimeInstalled\n              && !adapter.probes.every"));
+        assert!(source.contains("if (!runtimeInstalled\n              && !adapter.probes.some"));
         assert!(source.contains(
             "const appMain = appMainCandidates.find(isVisible) ?? appMainCandidates[0] ?? null"
         ));
@@ -5399,12 +6900,74 @@ mod tests {
     }
 
     #[test]
+    fn wallpaper_controls_use_a_tokenized_loopback_route_and_persist() {
+        let directory = tempfile::tempdir().expect("temporary controls directory");
+        let settings_path = directory.path().join("wallpaper-controls.json");
+        let store = WallpaperControlsStore::new(settings_path.clone());
+        assert_eq!(store.get().expect("initial controls"), None);
+
+        let (_server, _urls, _revoke_url, controls_url) =
+            ThemeAssetServer::start_with_controls(Vec::new(), Some(store.clone()), None)
+                .expect("controls server");
+        let controls_url = controls_url.expect("controls URL");
+        assert!(controls_url.starts_with("http://127.0.0.1:"));
+        let response = get_theme_asset_response(
+            &format!(
+                "{controls_url}?wallpaperBrightness=81&interfaceTransparency=67&playbackPaused=true"
+            ),
+            None,
+        );
+        assert!(response.starts_with(b"HTTP/1.1 204 No Content\r\n"));
+        assert_eq!(
+            store.get().expect("saved controls"),
+            Some(theme::WallpaperControls::new(81, 67).expect("valid controls"))
+        );
+        assert!(settings_path.is_file());
+
+        let response = get_theme_asset_response(
+            &format!("{controls_url}?wallpaperBrightness=101&interfaceTransparency=67"),
+            None,
+        );
+        assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+        let response = get_theme_asset_response(
+            &format!("{controls_url}?wallpaperBrightness=50&interfaceTransparency=50"),
+            Some("localhost"),
+        );
+        assert!(response.starts_with(b"HTTP/1.1 404 Not Found\r\n"));
+    }
+
+    #[test]
+    fn wallpaper_runtime_injects_live_collapsible_controls() {
+        let source = include_str!("codex.rs");
+
+        for fragment in [
+            "const ensureWallpaperControls = root =>",
+            "data-ct-wallpaper-brightness",
+            "data-ct-interface-transparency",
+            "data-ct-wallpaper-playback",
+            "['video', 'scene'].includes(config.wallpaper?.kind)",
+            "playbackPaused",
+            "setWallpaperControls",
+            "const setWallpaperPlaybackPaused = paused =>",
+            "setWallpaperPlaybackPaused(!wallpaperPlaybackPaused)",
+            "if (wallpaperPlaybackPaused) {",
+            "video.pause();",
+            "aria-pressed",
+            "--ct-wallpaper-brightness",
+            "--ct-interface-opacity",
+            "wallpaper.controls",
+        ] {
+            assert!(source.contains(fragment), "missing {fragment}");
+        }
+    }
+
+    #[test]
     fn serves_theme_assets_only_from_the_session_url() {
-        let asset = theme::ThemeRuntimeAsset {
-            path: "assets/test.svg".into(),
-            mime: "image/svg+xml".into(),
-            source: Arc::from(b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>".to_vec()),
-        };
+        let asset = theme::ThemeRuntimeAsset::from_memory(
+            "assets/test.svg".into(),
+            "image/svg+xml".into(),
+            b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>".to_vec(),
+        );
         let (server, urls, revoke_url) =
             ThemeAssetServer::start(vec![asset]).expect("asset server");
         let url = &urls["assets/test.svg"];
@@ -5449,6 +7012,101 @@ mod tests {
     }
 
     #[test]
+    fn serves_web_wallpaper_files_from_relative_sandbox_routes() {
+        let directory = tempfile::tempdir().expect("web wallpaper directory");
+        let index_path = directory.path().join("index.html");
+        let script_path = directory.path().join("app.js");
+        fs::write(&index_path, br#"<script src="app.js"></script>"#).expect("web entry");
+        fs::write(&script_path, b"window.ready=true").expect("web script");
+        let assets = vec![
+            theme::ThemeRuntimeAsset::from_web_file(
+                "wallpaper-engine/background-video".into(),
+                "text/html; charset=utf-8".into(),
+                index_path,
+                "web/index.html".into(),
+            ),
+            theme::ThemeRuntimeAsset::from_web_file(
+                "wallpaper-engine/web/app.js".into(),
+                "text/javascript; charset=utf-8".into(),
+                script_path,
+                "web/app.js".into(),
+            ),
+        ];
+        let (_server, urls, _) = ThemeAssetServer::start(assets).expect("web asset server");
+        let index_url = &urls["wallpaper-engine/background-video"];
+        assert!(index_url.ends_with("/web/index.html"));
+        let response = get_theme_asset_response(index_url, None);
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.contains("connect-src 'none'"));
+        assert!(response_text.contains("object-src 'none'"));
+        assert!(response_text.contains("form-action 'none'"));
+        let script_url = index_url.replace("index.html", "app.js");
+        let response = get_theme_asset_response(&script_url, None);
+        assert!(response.ends_with(b"window.ready=true"));
+    }
+
+    #[test]
+    fn wallpaper_runtime_streams_scene_frames_to_a_canvas_and_sandboxes_web_iframes() {
+        let source = include_str!("codex.rs");
+        for fragment in [
+            "['video', 'scene', 'web'].includes(config.wallpaper?.kind)",
+            "mediaType === 'scene' ? 'canvas' : 'img'",
+            "media.setAttribute('sandbox', 'allow-scripts')",
+            "[data-ct-mount=\"app.background\"] canvas[data-ct-scene-source]",
+            "retheme-scene-frame-pump",
+            "BASE64_STANDARD.encode(frame.jpeg.as_ref())",
+            "pushSceneFrame?.('{encoded_frame}'",
+            "const binary = atob(encodedFrame)",
+            "new Blob([payload], {{ type: 'image/jpeg' }})",
+            "bitmapContext.transferFromImageBitmap(bitmap)",
+            "sceneFrameStats.droppedFrames",
+            "sceneFrameStats.receivedFrames",
+            "getScenePlaybackStats",
+        ] {
+            assert!(source.contains(fragment), "missing {fragment}");
+        }
+        let obsolete_frame_bridge = ["setScene", "WallpaperFrame"].concat();
+        let obsolete_base64_transport = ["data:image/jpeg", ";base64"].concat();
+        let obsolete_mjpeg_transport = ["multipart/x-mixed", "retheme-frame"].concat();
+        assert!(!source.contains(&obsolete_frame_bridge));
+        assert!(!source.contains(&obsolete_base64_transport));
+        assert!(!source.contains(&obsolete_mjpeg_transport));
+        let obsolete_scene_temp_file = ["scene-frame", "-a.jpg"].concat();
+        assert!(!source.contains(&obsolete_scene_temp_file));
+        let obsolete_scene_fetch = ["fetch", "(url"].concat();
+        assert!(!source.contains(&obsolete_scene_fetch));
+        let obsolete_scene_file_input = ["data-ct-scene", "-frame-input"].concat();
+        assert!(!source.contains(&obsolete_scene_file_input));
+    }
+
+    #[test]
+    fn streams_local_video_assets_with_http_ranges() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let video_path = directory.path().join("wallpaper.mp4");
+        fs::write(&video_path, b"0123456789").expect("test video");
+        let asset = theme::ThemeRuntimeAsset::from_file(
+            "wallpaper-engine/background-video".into(),
+            "video/mp4".into(),
+            video_path,
+        );
+        let (_server, urls, _) = ThemeAssetServer::start(vec![asset]).expect("asset server");
+        let url = &urls["wallpaper-engine/background-video"];
+
+        let response = get_theme_asset_range_response(url, "bytes=2-5");
+        assert!(response.starts_with(b"HTTP/1.1 206 Partial Content\r\n"));
+        assert!(
+            response
+                .windows(b"Content-Range: bytes 2-5/10\r\n".len())
+                .any(|window| window == b"Content-Range: bytes 2-5/10\r\n")
+        );
+        assert!(response.ends_with(b"2345"));
+
+        let response = get_theme_asset_range_response(url, "bytes=50-60");
+        assert!(response.starts_with(b"HTTP/1.1 416 Range Not Satisfiable\r\n"));
+    }
+
+    #[test]
     #[ignore = "launches an isolated ChatGPT App window"]
     #[cfg(target_os = "macos")]
     fn chatgpt_app_loads_session_asset_urls() {
@@ -5457,13 +7115,11 @@ mod tests {
         let (port, _) =
             wait_for_devtools(instance._profile.path(), &mut instance.process).expect("devtools");
         wait_for_codex_target(port, &mut instance.process).expect("ChatGPT page");
-        let asset = theme::ThemeRuntimeAsset {
-            path: "assets/test.svg".into(),
-            mime: "image/svg+xml".into(),
-            source: Arc::from(
-                b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"2\" height=\"2\"/>".to_vec(),
-            ),
-        };
+        let asset = theme::ThemeRuntimeAsset::from_memory(
+            "assets/test.svg".into(),
+            "image/svg+xml".into(),
+            b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"2\" height=\"2\"/>".to_vec(),
+        );
         let (_server, urls, _) = ThemeAssetServer::start(vec![asset]).expect("asset server");
         let asset_url = serde_json::to_string(&urls["assets/test.svg"]).expect("asset URL JSON");
         let expression = format!(
@@ -5613,6 +7269,24 @@ mod tests {
         response
     }
 
+    fn get_theme_asset_range_response(url: &str, range: &str) -> Vec<u8> {
+        let address = url_socket(url);
+        let path = url
+            .split_once(address.to_string().as_str())
+            .expect("asset URL")
+            .1;
+        let mut stream =
+            TcpStream::connect_timeout(&address, Duration::from_secs(1)).expect("asset connection");
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: {address}\r\nRange: {range}\r\nConnection: close\r\n\r\n"
+        )
+        .expect("range request");
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).expect("range response");
+        response
+    }
+
     fn url_socket(url: &str) -> SocketAddr {
         url.strip_prefix("http://")
             .and_then(|url| url.split_once('/'))
@@ -5708,6 +7382,23 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(startup_slots_ready(&compact_home_slots));
 
+        let other_slots = REQUIRED_OTHER_STARTUP_SLOTS
+            .iter()
+            .map(|slot| (*slot).to_owned())
+            .chain(["view:other".to_owned()])
+            .collect::<Vec<_>>();
+        assert!(startup_slots_ready(&other_slots));
+
+        assert!(!other_slots.iter().any(|slot| slot == "composer"));
+        assert!(!other_slots.iter().any(|slot| slot == "main"));
+
+        let mut other_without_background = other_slots;
+        other_without_background.retain(|slot| slot != "app.background");
+        assert_eq!(
+            missing_startup_slots(&other_without_background),
+            ["app.background"]
+        );
+
         let missing_view = REQUIRED_GLOBAL_STARTUP_SLOTS
             .iter()
             .chain(REQUIRED_COMPOSER_STARTUP_SLOTS)
@@ -5717,6 +7408,54 @@ mod tests {
             missing_startup_slots(&missing_view),
             [REQUIRED_STARTUP_VIEW]
         );
+    }
+
+    #[test]
+    fn waits_for_the_rendered_app_document_instead_of_the_early_target_url() {
+        assert!(!codex_target_document_ready_value(&json!({
+            "url": "about:blank",
+            "readyState": "complete",
+            "hasDocument": true
+        })));
+        assert!(!codex_target_document_ready_value(&json!({
+            "url": "app://-/index.html",
+            "readyState": "loading",
+            "hasDocument": true
+        })));
+        assert!(!codex_target_document_ready_value(&json!({
+            "url": "app://-/index.html",
+            "readyState": "complete",
+            "hasDocument": false
+        })));
+        assert!(codex_target_document_ready_value(&json!({
+            "url": "app://-/index.html",
+            "readyState": "complete",
+            "hasDocument": true
+        })));
+    }
+
+    #[test]
+    fn retries_only_transient_isolated_start_failures() {
+        for message in [
+            "隔离 ChatGPT 提前退出",
+            "等待 ChatGPT 主题界面就绪超时",
+            "等待稳定的 ChatGPT 页面目标超时",
+            "读取本地主题通道响应失败：IO error: os error 10060",
+        ] {
+            assert!(is_retryable_isolated_start_error(&CodexError(
+                message.into()
+            )));
+        }
+        for message in [
+            "主题授权或试用已到期",
+            "已有主题预览正在运行，请先恢复当前主题",
+            "主题预览启动发生并发冲突",
+            "本地主题通道地址不是回环地址",
+        ] {
+            assert!(!is_retryable_isolated_start_error(&CodexError(
+                message.into()
+            )));
+        }
     }
 
     #[test]
@@ -6100,6 +7839,259 @@ mod tests {
         assert!(report.loopback_only);
         assert!(report.probe_applied);
         assert!(report.probe_removed);
+        assert!(
+            report.compatible,
+            "missing adapter probes: {:?}",
+            report.missing_adapter_probes
+        );
+    }
+
+    #[test]
+    #[ignore = "launches a local Wallpaper Engine video; set RETHEME_TEST_WALLPAPER_PROJECT"]
+    #[cfg(target_os = "windows")]
+    fn plays_wallpaper_engine_video_from_a_browser_file_handle() {
+        let project_path = std::env::var_os("RETHEME_TEST_WALLPAPER_PROJECT")
+            .map(PathBuf::from)
+            .expect("RETHEME_TEST_WALLPAPER_PROJECT");
+        let runtime = ThemeRuntime::default();
+        let installation = detect().expect("installed ChatGPT");
+        let adapter = compatibility::builtin_adapter(&installation.version);
+        let controls = theme::WallpaperControls::new(100, 32).expect("wallpaper controls");
+        let package = theme::load_wallpaper_engine_project(&project_path, controls)
+            .expect("Wallpaper Engine video package");
+        let controls_directory = tempfile::tempdir().expect("wallpaper controls directory");
+        let controls_store =
+            WallpaperControlsStore::new(controls_directory.path().join("wallpaper-controls.json"));
+        let report = start_theme_package_preview_attempt(
+            &runtime,
+            &installation,
+            &adapter,
+            package,
+            ThemePreviewSource::WallpaperEngine,
+            None,
+            false,
+            "zh-CN",
+            Some(controls_store),
+        )
+        .expect("dynamic wallpaper preview");
+        assert!(
+            report
+                .applied_slots
+                .iter()
+                .any(|slot| slot == "app.background")
+        );
+
+        let websocket_url = {
+            let mut session = runtime.session.lock().expect("theme session");
+            let session = session.as_mut().expect("active theme session");
+            wait_for_codex_target(session.port, &mut session.instance.process)
+                .expect("themed ChatGPT page")
+                .web_socket_debugger_url
+        };
+        let playback = |id| {
+            let mut socket = connect_theme_channel(&websocket_url).expect("theme channel");
+            let value = evaluate_value(
+                &mut socket,
+                id,
+                r#"(() => {
+                  const video = document.querySelector('[data-ct-mount="app.background"] video');
+                  return {
+                    sourceReady: video?.src?.startsWith('blob:') ?? false,
+                    readyState: video?.readyState ?? -1,
+                    paused: video?.paused ?? true,
+                    errorCode: video?.error?.code ?? 0,
+                    currentTime: video?.currentTime ?? 0
+                  };
+                })()"#,
+            )
+            .expect("video playback status");
+            let _ = socket.close(None);
+            value
+        };
+        let first = playback(1);
+        thread::sleep(Duration::from_secs(6));
+        let second = playback(2);
+        assert_eq!(second["sourceReady"], true);
+        assert!(second["readyState"].as_i64().unwrap_or(-1) >= 2);
+        assert_eq!(second["paused"], false);
+        assert_eq!(second["errorCode"], 0);
+        assert!(
+            second["currentTime"].as_f64().unwrap_or(0.0)
+                > first["currentTime"].as_f64().unwrap_or(0.0)
+        );
+        assert!(stop_theme_preview(&runtime).expect("stop dynamic wallpaper"));
+    }
+
+    #[test]
+    #[ignore = "launches a local original Scene/Web project; set RETHEME_TEST_WALLPAPER_NON_VIDEO_PROJECT"]
+    #[cfg(target_os = "windows")]
+    fn plays_wallpaper_engine_scene_or_web_in_the_background_mount() {
+        let project_path = std::env::var_os("RETHEME_TEST_WALLPAPER_NON_VIDEO_PROJECT")
+            .map(PathBuf::from)
+            .expect("RETHEME_TEST_WALLPAPER_NON_VIDEO_PROJECT");
+        let project_manifest: Value = serde_json::from_slice(
+            &fs::read(project_path.join("project.json")).expect("Wallpaper Engine project.json"),
+        )
+        .expect("Wallpaper Engine project manifest");
+        let project_type = project_manifest["type"]
+            .as_str()
+            .expect("Wallpaper Engine project type");
+        assert!(matches!(project_type, "scene" | "web"));
+        let runtime = ThemeRuntime::default();
+        let installation = detect().expect("installed ChatGPT");
+        let adapter = compatibility::builtin_adapter(&installation.version);
+        let controls = theme::WallpaperControls::new(100, 32).expect("wallpaper controls");
+        let package = theme::load_wallpaper_engine_project(&project_path, controls)
+            .expect("Wallpaper Engine non-video package");
+        let controls_directory = tempfile::tempdir().expect("wallpaper controls directory");
+        let controls_store =
+            WallpaperControlsStore::new(controls_directory.path().join("wallpaper-controls.json"));
+        let report = start_theme_package_preview_attempt(
+            &runtime,
+            &installation,
+            &adapter,
+            package,
+            ThemePreviewSource::WallpaperEngine,
+            None,
+            false,
+            "zh-CN",
+            Some(controls_store),
+        )
+        .expect("dynamic wallpaper preview");
+        assert!(
+            report
+                .applied_slots
+                .iter()
+                .any(|slot| slot == "app.background")
+        );
+        let websocket_url = {
+            let mut session = runtime.session.lock().expect("theme session");
+            let session = session.as_mut().expect("active theme session");
+            wait_for_codex_target(session.port, &mut session.instance.process)
+                .expect("themed ChatGPT page")
+                .web_socket_debugger_url
+        };
+        thread::sleep(Duration::from_secs(5));
+        let mut socket = connect_theme_channel(&websocket_url).expect("theme channel");
+        let state = evaluate_value(
+            &mut socket,
+            1,
+            r#"(() => {
+              const canvas = document.querySelector(
+                '[data-ct-mount="app.background"] canvas[data-ct-scene-source]'
+              );
+              const iframe = document.querySelector(
+                '[data-ct-mount="app.background"] iframe[sandbox="allow-scripts"]'
+              );
+              return {
+                sceneReady: canvas instanceof HTMLCanvasElement
+                  && canvas.dataset.ctSceneReady === 'true'
+                  && canvas.width >= 1280 && canvas.height >= 720,
+                webReady: iframe instanceof HTMLIFrameElement
+                  && iframe.dataset.ctWebLoaded === 'true',
+                sceneExists: canvas instanceof HTMLCanvasElement,
+                sceneWidth: canvas?.width ?? 0,
+                sceneHeight: canvas?.height ?? 0,
+                sceneFrame: canvas?.dataset.ctSceneFrame ?? null,
+                sceneStats: window.__codexThemeRuntime?.getScenePlaybackStats?.() ?? null,
+                sceneCaptureMode: window.__codexThemeRuntime?.sceneCaptureMode ?? null,
+                runtimeError: window.__codexThemeRuntime?.lastApplyError ?? null
+              };
+            })()"#,
+        )
+        .expect("non-video wallpaper state");
+        let _ = socket.close(None);
+        assert_eq!(
+            state[if project_type == "scene" {
+                "sceneReady"
+            } else {
+                "webReady"
+            }],
+            true,
+            "{project_type} wallpaper did not become ready: {state}"
+        );
+        if project_type == "scene" {
+            let decoded_frames = state
+                .pointer("/sceneStats/decodedFrames")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let frames_per_second = state
+                .pointer("/sceneStats/framesPerSecond")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            eprintln!(
+                "Scene canvas playback: decoded_frames={decoded_frames} fps={frames_per_second:.1} state={state}"
+            );
+            assert!(decoded_frames >= 3, "Scene frames did not advance: {state}");
+            assert_eq!(
+                state["sceneCaptureMode"], "desktop-synchronized",
+                "Scene did not reuse the synchronized desktop renderer: {state}"
+            );
+
+            let mut socket = connect_theme_channel(&websocket_url).expect("pause theme channel");
+            assert!(
+                evaluate(
+                    &mut socket,
+                    2,
+                    "window.__codexThemeRuntime?.setWallpaperPlaybackPaused?.(true)?.paused === true"
+                )
+                .expect("pause Scene wallpaper")
+            );
+            let _ = socket.close(None);
+            thread::sleep(Duration::from_millis(500));
+            let mut socket = connect_theme_channel(&websocket_url).expect("paused theme channel");
+            let paused_sequence = evaluate_value(
+                &mut socket,
+                3,
+                "window.__codexThemeRuntime?.getScenePlaybackStats?.().sequence ?? 0",
+            )
+            .expect("paused Scene sequence")
+            .as_u64()
+            .unwrap_or(0);
+            let _ = socket.close(None);
+            thread::sleep(Duration::from_secs(1));
+            let mut socket = connect_theme_channel(&websocket_url).expect("pause proof channel");
+            let held_sequence = evaluate_value(
+                &mut socket,
+                4,
+                "window.__codexThemeRuntime?.getScenePlaybackStats?.().sequence ?? 0",
+            )
+            .expect("held Scene sequence")
+            .as_u64()
+            .unwrap_or(0);
+            assert_eq!(
+                held_sequence, paused_sequence,
+                "Scene wallpaper advanced while paused"
+            );
+            assert!(
+                evaluate(
+                    &mut socket,
+                    5,
+                    "window.__codexThemeRuntime?.setWallpaperPlaybackPaused?.(false)?.paused === false"
+                )
+                .expect("resume Scene wallpaper")
+            );
+            let _ = socket.close(None);
+            thread::sleep(Duration::from_secs(1));
+            let mut socket = connect_theme_channel(&websocket_url).expect("resume proof channel");
+            let resumed_sequence = evaluate_value(
+                &mut socket,
+                6,
+                "window.__codexThemeRuntime?.getScenePlaybackStats?.().sequence ?? 0",
+            )
+            .expect("resumed Scene sequence")
+            .as_u64()
+            .unwrap_or(0);
+            let _ = socket.close(None);
+            assert!(
+                resumed_sequence > held_sequence,
+                "Scene wallpaper did not resume: paused={held_sequence}, resumed={resumed_sequence}"
+            );
+            eprintln!(
+                "Scene pause/resume: paused={paused_sequence} held={held_sequence} resumed={resumed_sequence}"
+            );
+        }
+        assert!(stop_theme_preview(&runtime).expect("stop dynamic wallpaper"));
     }
 
     #[test]

@@ -266,6 +266,14 @@ impl CompatibilityRepository {
     }
 }
 
+impl CodexAdapter {
+    pub(crate) fn supports_version(&self, codex_version: &str) -> bool {
+        parse_version(codex_version, "Codex")
+            .ok()
+            .is_some_and(|version| range_contains(&self.codex, &version))
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ApiEnvelope {
     code: u16,
@@ -274,7 +282,7 @@ struct ApiEnvelope {
 }
 
 pub fn builtin_adapter(codex_version: &str) -> CodexAdapter {
-    let Some(version) = Version::parse(codex_version).ok() else {
+    let Some(version) = parse_version(codex_version, "Codex").ok() else {
         return builtin_latest_adapter();
     };
     let adapters = builtin_adapters();
@@ -412,7 +420,15 @@ fn validate_config(
 }
 
 fn parse_version(version: &str, name: &str) -> Result<Version, CompatibilityError> {
-    Version::parse(version).map_err(|error| CompatibilityError(format!("{name}版本无效：{error}")))
+    Version::parse(version)
+        .or_else(|original_error| {
+            let parts = version.split('.').collect::<Vec<_>>();
+            if parts.len() != 4 || parts.iter().any(|part| part.parse::<u64>().is_err()) {
+                return Err(original_error);
+            }
+            Version::parse(&parts[..3].join("."))
+        })
+        .map_err(|error| CompatibilityError(format!("{name}版本无效：{error}")))
 }
 
 fn validate_range(range: &VersionRange, name: &str) -> Result<(), CompatibilityError> {
@@ -590,6 +606,8 @@ mod tests {
     fn selects_builtin_adapter_by_codex_version() {
         assert_eq!(builtin_adapter("26.707.91948").id, "codex-2026-home-v1");
         assert_eq!(builtin_adapter("26.715.21316").id, "codex-2026-home-v2");
+        assert_eq!(builtin_adapter("26.818.5229.0").id, "codex-2026-home-v2");
+        assert!(builtin_adapter("26.818.5229.0").supports_version("26.818.5229.0"));
         assert_eq!(builtin_adapter("26.600.1").id, "codex-2026-home-v1");
         assert_eq!(builtin_adapter("27.1.0").id, "codex-2026-home-v2");
         assert!(

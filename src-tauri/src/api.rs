@@ -130,8 +130,8 @@ mod tests {
     use reqwest::Client;
 
     #[test]
-    fn uses_desktop_api_by_default() {
-        assert_eq!(config().base_url, "https://theme.dux.cn/api/desktop/v1");
+    fn local_features_build_does_not_contact_the_desktop_api() {
+        assert_eq!(config().base_url, "https://127.0.0.1");
     }
 
     #[test]

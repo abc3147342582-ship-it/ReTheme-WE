@@ -4,20 +4,26 @@ mod codex;
 mod compatibility;
 mod security_config;
 mod theme;
+mod wallpaper_engine;
 
 use account::{AccountRuntime, AccountStatus, AccountSync, OAuthStart};
-use codex::{CodexInstallation, SmokeTestReport, ThemePreviewReport, ThemeRuntime};
+use codex::{
+    CodexInstallation, SmokeTestReport, ThemePreviewReport, ThemeRuntime, WallpaperControlsStore,
+};
 use compatibility::CompatibilityRepository;
 use serde::Serialize;
 use std::path::PathBuf;
 use tauri::{
-    Manager, State,
+    Manager, State, WebviewUrl, WebviewWindowBuilder,
     menu::{MenuBuilder, MenuItemBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 use tauri_plugin_deep_link::DeepLinkExt;
-use theme::{ThemeInstallReport, ThemeRepository, ThemeSummary};
+use tauri_plugin_updater::UpdaterExt;
+use theme::{
+    ThemeInstallReport, ThemeRepository, ThemeSummary, WallpaperControls, WallpaperEngineCatalog,
+};
 
 const TRAY_OPEN_ID: &str = "open";
 const TRAY_RESTORE_ID: &str = "restore";
@@ -54,6 +60,14 @@ struct RuntimeEnvironment {
     compatibility: Option<compatibility::CompatibilityStatus>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GithubUpdate {
+    current_version: String,
+    version: String,
+    body: Option<String>,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum TrayAction {
     Open,
@@ -77,7 +91,38 @@ fn show_main_window(app: &tauri::AppHandle) {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
+        return;
     }
+    if let Ok(window) = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+        .title("ReTheme WE")
+        .inner_size(1040.0, 720.0)
+        .resizable(false)
+        .maximizable(false)
+        .build()
+    {
+        let _ = window.set_focus();
+    }
+}
+
+fn github_update_endpoint(repository: &str) -> Result<tauri::Url, String> {
+    let mut parts = repository.split('/');
+    let owner = parts.next().unwrap_or_default();
+    let repo = parts.next().unwrap_or_default();
+    let valid_segment = |segment: &str| {
+        !segment.is_empty()
+            && segment != "."
+            && segment != ".."
+            && segment
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    };
+    if parts.next().is_some() || !valid_segment(owner) || !valid_segment(repo) {
+        return Err("GitHub 更新仓库格式必须是 owner/repo".to_owned());
+    }
+    tauri::Url::parse(&format!(
+        "https://github.com/{owner}/{repo}/releases/latest/download/latest.json"
+    ))
+    .map_err(|error| format!("GitHub 更新地址无效：{error}"))
 }
 
 fn hide_main_window(window: &tauri::Window) {
@@ -173,11 +218,16 @@ fn detect_codex() -> Result<CodexInstallation, String> {
 }
 
 #[tauri::command]
-async fn run_cdp_smoke_test() -> Result<SmokeTestReport, String> {
-    tauri::async_runtime::spawn_blocking(codex::run_smoke_test)
-        .await
-        .map_err(|error| format!("测试任务异常结束：{error}"))?
-        .map_err(|error| error.to_string())
+async fn run_cdp_smoke_test(
+    compatibility: State<'_, CompatibilityRepository>,
+) -> Result<SmokeTestReport, String> {
+    let compatibility = compatibility.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        codex::run_compatibility_self_check(&compatibility)
+    })
+    .await
+    .map_err(|error| format!("测试任务异常结束：{error}"))?
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -275,6 +325,78 @@ async fn start_local_theme_preview(
     })
     .await
     .map_err(|error| format!("本地主题预览任务异常结束：{error}"))?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn wallpaper_engine_catalog() -> Result<WallpaperEngineCatalog, String> {
+    tauri::async_runtime::spawn_blocking(theme::wallpaper_engine_catalog)
+        .await
+        .map_err(|error| format!("Wallpaper Engine 扫描任务异常结束：{error}"))?
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn start_wallpaper_engine_preview(
+    project_path: PathBuf,
+    locale: String,
+    wallpaper_brightness: u8,
+    interface_transparency: u8,
+    runtime: State<'_, ThemeRuntime>,
+    controls_store: State<'_, WallpaperControlsStore>,
+    account: State<'_, AccountRuntime>,
+    compatibility: State<'_, CompatibilityRepository>,
+) -> Result<ThemePreviewReport, String> {
+    let runtime = runtime.inner().clone();
+    let controls_store = controls_store.inner().clone();
+    let compatibility = compatibility.inner().clone();
+    let has_pro = account.has_active_pro();
+    if let Ok(installation) = codex::detect() {
+        let _ = compatibility.refresh(installation.version()).await;
+    }
+    let controls = WallpaperControls::new(wallpaper_brightness, interface_transparency)
+        .map_err(|error| error.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        codex::start_wallpaper_engine_preview(
+            &runtime,
+            &compatibility,
+            &project_path,
+            controls,
+            &controls_store,
+            has_pro,
+            &locale,
+        )
+    })
+    .await
+    .map_err(|error| format!("Wallpaper Engine 预览任务异常结束：{error}"))?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn wallpaper_control_preferences(
+    controls_store: State<'_, WallpaperControlsStore>,
+) -> Result<Option<WallpaperControls>, String> {
+    controls_store.get().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn update_wallpaper_controls(
+    wallpaper_brightness: u8,
+    interface_transparency: u8,
+    runtime: State<'_, ThemeRuntime>,
+    controls_store: State<'_, WallpaperControlsStore>,
+) -> Result<WallpaperControls, String> {
+    let controls = WallpaperControls::new(wallpaper_brightness, interface_transparency)
+        .map_err(|error| error.to_string())?;
+    let controls = controls_store
+        .set(controls)
+        .map_err(|error| error.to_string())?;
+    let runtime = runtime.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        codex::update_wallpaper_controls(&runtime, controls).map(|_| controls)
+    })
+    .await
+    .map_err(|error| format!("动态壁纸调节同步任务异常结束：{error}"))?
     .map_err(|error| error.to_string())
 }
 
@@ -405,6 +527,66 @@ fn theme_preview_status(
 }
 
 #[tauri::command]
+fn release_ui_memory(
+    app: tauri::AppHandle,
+    runtime: State<'_, ThemeRuntime>,
+) -> Result<(), String> {
+    if runtime
+        .current_preview()
+        .map_err(|error| error.to_string())?
+        .is_none()
+    {
+        return Err("当前没有运行中的主题，未关闭管理窗口".to_owned());
+    }
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.destroy();
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+async fn check_github_update(
+    repository: String,
+    app: tauri::AppHandle,
+) -> Result<Option<GithubUpdate>, String> {
+    let endpoint = github_update_endpoint(repository.trim())?;
+    let updater = app
+        .updater_builder()
+        .endpoints(vec![endpoint])
+        .map_err(|error| error.to_string())?
+        .build()
+        .map_err(|error| error.to_string())?;
+    let update = updater.check().await.map_err(|error| error.to_string())?;
+    Ok(update.map(|update| GithubUpdate {
+        current_version: update.current_version,
+        version: update.version,
+        body: update.body,
+    }))
+}
+
+#[tauri::command]
+async fn install_github_update(repository: String, app: tauri::AppHandle) -> Result<bool, String> {
+    let endpoint = github_update_endpoint(repository.trim())?;
+    let updater = app
+        .updater_builder()
+        .endpoints(vec![endpoint])
+        .map_err(|error| error.to_string())?
+        .build()
+        .map_err(|error| error.to_string())?;
+    let Some(update) = updater.check().await.map_err(|error| error.to_string())? else {
+        return Ok(false);
+    };
+    update
+        .download_and_install(|_, _| {}, || {})
+        .await
+        .map_err(|error| format!("更新包下载或签名验证失败：{error}"))?;
+    Ok(true)
+}
+
+#[tauri::command]
 fn runtime_environment(compatibility: State<'_, CompatibilityRepository>) -> RuntimeEnvironment {
     RuntimeEnvironment {
         app_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -436,6 +618,9 @@ pub fn run() {
                 .path()
                 .app_data_dir()
                 .map_err(|error| format!("无法定位应用数据目录：{error}"))?;
+            app.manage(WallpaperControlsStore::new(
+                app_data_dir.join("wallpaper-controls.json"),
+            ));
             let account = AccountRuntime::new(app_data_dir.join("account"))
                 .map_err(|error| error.to_string())?;
             let repository = ThemeRepository::new_with_cache_key(
@@ -494,8 +679,15 @@ pub fn run() {
             uninstall_theme,
             start_theme_preview,
             start_local_theme_preview,
+            wallpaper_engine_catalog,
+            start_wallpaper_engine_preview,
+            wallpaper_control_preferences,
+            update_wallpaper_controls,
             stop_theme_preview,
             theme_preview_status,
+            release_ui_memory,
+            check_github_update,
+            install_github_update,
             runtime_environment,
             sync_tray_locale,
             sync_theme_locale,
@@ -510,13 +702,28 @@ pub fn run() {
             account_redeem_cdk,
             download_online_theme
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to run ReTheme");
+        .build(tauri::generate_context!())
+        .expect("failed to build ReTheme")
+        .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested { api, code, .. } = event
+                && code.is_none()
+                && app
+                    .state::<ThemeRuntime>()
+                    .current_preview()
+                    .ok()
+                    .flatten()
+                    .is_some()
+            {
+                api.prevent_exit();
+            }
+        });
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{TrayAction, should_hide_main_window, tray_action, tray_labels};
+    use super::{
+        TrayAction, github_update_endpoint, should_hide_main_window, tray_action, tray_labels,
+    };
 
     #[test]
     fn parses_supported_tray_actions() {
@@ -541,5 +748,27 @@ mod tests {
         assert!(should_hide_main_window("main", true));
         assert!(!should_hide_main_window("main", false));
         assert!(!should_hide_main_window("account", true));
+    }
+
+    #[test]
+    fn accepts_only_github_owner_repo_update_channels() {
+        assert_eq!(
+            github_update_endpoint("example/retheme-we")
+                .expect("valid repository")
+                .as_str(),
+            "https://github.com/example/retheme-we/releases/latest/download/latest.json"
+        );
+        for invalid in [
+            "",
+            "example",
+            "example/repo/extra",
+            "../repo",
+            "owner/repo?q=1",
+        ] {
+            assert!(
+                github_update_endpoint(invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
     }
 }

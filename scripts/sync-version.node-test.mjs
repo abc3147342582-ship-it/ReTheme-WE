@@ -19,7 +19,7 @@ test("synchronizes every desktop version source", () => {
   assert.equal(JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version, "1.2.3");
   assert.equal(JSON.parse(readFileSync(join(root, "src-tauri/tauri.conf.json"), "utf8")).version, "1.2.3");
   assert.match(readFileSync(join(root, "src-tauri/Cargo.toml"), "utf8"), /\[package\][\s\S]*?version = "1\.2\.3"/);
-  assert.match(readFileSync(join(root, "src-tauri/Cargo.lock"), "utf8"), /name = "retheme"\nversion = "1\.2\.3"/);
+  assert.match(readFileSync(join(root, "src-tauri/Cargo.lock"), "utf8"), /name = "retheme-we"\nversion = "1\.2\.3"/);
 
   const check = spawnSync(process.execPath, [join(projectRoot, "scripts/sync-version.mjs"), "1.2.3", "--check", "--root", root], { encoding: "utf8" });
   assert.equal(check.status, 0, check.stderr);

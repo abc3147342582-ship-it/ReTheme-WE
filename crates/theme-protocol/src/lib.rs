@@ -973,6 +973,17 @@ fn validate_selector(selector: &str, theme_id: &str) -> Result<(), ThemeError> {
                 | "ct-home-hero__description"
                 | "ct-home-hero__image"
                 | "ct-decoration"
+                | "ct-wallpaper-controls"
+                | "ct-wallpaper-controls--collapsed"
+                | "ct-wallpaper-controls__panel"
+                | "ct-wallpaper-controls__header"
+                | "ct-wallpaper-controls__collapse"
+                | "ct-wallpaper-controls__field"
+                | "ct-wallpaper-controls__label"
+                | "ct-wallpaper-controls__range"
+                | "ct-wallpaper-controls__playback"
+                | "ct-wallpaper-controls__playback-icon"
+                | "ct-wallpaper-controls__open"
         ) {
             return Err(ThemeError(format!("主题选择器使用了非平台类名：.{class}")));
         }
@@ -1215,6 +1226,17 @@ mod tests {
     fn selector_lists_preserve_nested_function_commas() {
         let source = r#":root[data-ct-theme="studio.example.theme"] :is([data-ct-slot="home.card"], [data-ct-slot="settings.card"]) { color: white; }"#;
         validate_css(source, "studio.example.theme").expect("nested selector commas");
+    }
+
+    #[test]
+    fn accepts_wallpaper_playback_control_selectors() {
+        let source = r#"
+:root[data-ct-theme="studio.example.theme"] .ct-wallpaper-controls__playback { color: white; }
+:root[data-ct-theme="studio.example.theme"] .ct-wallpaper-controls__playback:hover { color: orange; }
+:root[data-ct-theme="studio.example.theme"] .ct-wallpaper-controls__playback:focus-visible { outline: 2px solid orange; }
+:root[data-ct-theme="studio.example.theme"] .ct-wallpaper-controls__playback-icon { display: inline-flex; }
+"#;
+        validate_css(source, "studio.example.theme").expect("wallpaper playback controls");
     }
 
     #[test]

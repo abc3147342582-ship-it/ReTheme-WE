@@ -11,6 +11,11 @@ export type CodexInstallation = {
 export type SmokeTestReport = {
   appVersion: string;
   browserVersion: string;
+  adapterId: string;
+  versionMatched: boolean;
+  adapterCompatible: boolean;
+  missingAdapterProbes: string[];
+  compatible: boolean;
   port: number;
   targetTitle: string;
   targetUrl: string;
@@ -45,12 +50,34 @@ export type AppLocale = "zh-CN" | "en";
 export type ThemePreviewReport = {
   themeId: string;
   theme: ThemeSummary;
-  source: "installed" | "localDevelopment";
+  source: "installed" | "localDevelopment" | "wallpaperEngine";
   expiresAt?: number;
   appVersion: string;
   port: number;
   appliedSlots: string[];
   loopbackOnly: boolean;
+};
+
+export type WallpaperEngineProject = {
+  id: string;
+  title: string;
+  projectType: string;
+  projectPath: string;
+  mediaPath?: string;
+  mediaSizeBytes?: number;
+  requiresWallpaperEngine: boolean;
+  supported: boolean;
+  reason?: string;
+};
+
+export type WallpaperEngineCatalog = {
+  root: string;
+  projects: WallpaperEngineProject[];
+};
+
+export type WallpaperControls = {
+  wallpaperBrightness: number;
+  interfaceTransparency: number;
 };
 
 export type RuntimeEnvironment = {
@@ -146,4 +173,5 @@ export type DesktopPreferences = {
   hideToTray: boolean;
   autoUpdate: boolean;
   autoDetectCodex: boolean;
+  lowMemoryMode: boolean;
 };

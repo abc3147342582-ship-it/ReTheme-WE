@@ -454,7 +454,7 @@ impl AccountRuntime {
                     "state": state,
                     "code_challenge": code_challenge,
                     "code_challenge_method": "S256",
-                    "redirect_uri": "retheme://auth/callback",
+                    "redirect_uri": "retheme-we://auth/callback",
                     "client_type": "desktop"
                 }),
             )
@@ -494,7 +494,7 @@ impl AccountRuntime {
                     "code": code,
                     "state": state,
                     "code_verifier": pending.code_verifier,
-                    "redirect_uri": "retheme://auth/callback",
+                    "redirect_uri": "retheme-we://auth/callback",
                     "client_type": "desktop"
                 }),
             )

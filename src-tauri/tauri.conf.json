@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "ReTheme",
-  "version": "0.1.0",
-  "identifier": "app.retheme.desktop",
+  "productName": "ReTheme WE",
+  "version": "0.4.7",
+  "identifier": "app.retheme.desktop.wallpaper",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "beforeBuildCommand": "pnpm build",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "ReTheme",
+        "title": "ReTheme WE",
         "width": 1040,
         "height": 720,
         "resizable": false,
@@ -26,7 +26,10 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["dmg", "nsis"],
+    "targets": [
+      "dmg",
+      "nsis"
+    ],
     "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
@@ -39,7 +42,10 @@
       "nsis": {
         "installerIcon": "icons/icon.ico",
         "installMode": "currentUser",
-        "languages": ["SimpChinese", "English"],
+        "languages": [
+          "SimpChinese",
+          "English"
+        ],
         "displayLanguageSelector": true
       }
     }
@@ -48,15 +54,13 @@
     "deep-link": {
       "desktop": {
         "schemes": [
-          "retheme"
+          "retheme-we"
         ]
       }
     },
     "updater": {
-      "endpoints": [
-        "https://github.com/duxweb/ReTheme/releases/latest/download/latest.json"
-      ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDgwNTVEREUwQzA0MTk2MkYKUldRdmxrSEE0TjFWZ05aRHRndXkwSmFyMXhpZ1lOVitVdWdaUGhhQ29oYWpOU291RUZSLzhDNnMK"
+      "endpoints": [],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQyNUE2NDU2MkRCMTY2REYKUldUZlpyRXRWbVJhUXA0cm00STRkRFlLMGFKenk4cGN4WHcyRloxVW5iN3hjR05nV0txMXRyTWkK"
     }
   }
 }

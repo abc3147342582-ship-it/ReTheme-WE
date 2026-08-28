@@ -36,7 +36,7 @@ const updates = [
   updateJson("package.json"),
   updateJson("src-tauri/tauri.conf.json"),
   updateText("src-tauri/Cargo.toml", /(\[package\][\s\S]*?^version\s*=\s*")([^"]+)(")/m, "Cargo package"),
-  updateText("src-tauri/Cargo.lock", /(\[\[package\]\]\nname = "retheme"\nversion = ")([^"]+)(")/, "Cargo lockfile package"),
+  updateText("src-tauri/Cargo.lock", /(\[\[package\]\]\r?\nname = "retheme-we"\r?\nversion = ")([^"]+)(")/, "Cargo lockfile package"),
 ];
 
 const mismatches = updates.filter((update) => update.current !== version);

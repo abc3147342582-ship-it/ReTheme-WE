@@ -456,7 +456,7 @@ button:focus-visible {
 .status-icon.codex .logo-mark i:nth-child(2) { top: 6px; right: 6px; }
 .status-icon.codex .logo-mark i:nth-child(3) { bottom: 5px; left: 10px; width: 6px; height: 3px; }
 .status-icon.license, .status-icon.diagnostic { color: var(--accent); background: var(--accent-soft); }
-.status-copy { min-width: 0; }
+.status-copy { flex: 1 1 0; min-width: 0; overflow: hidden; }
 .status-copy span { color: var(--quiet); font-size: 12px; font-weight: 600; letter-spacing: 0.08em; }
 .status-copy strong { display: block; margin-top: 3px; overflow: hidden; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
 .status-copy p { margin: 3px 0 0; overflow: hidden; color: var(--muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
@@ -519,6 +519,85 @@ button:focus-visible {
   scrollbar-width: thin;
   scrollbar-color: var(--line-strong) transparent;
 }
+
+.wallpaper-import {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr)) auto auto;
+  grid-template-areas:
+    "copy copy copy rescan apply"
+    "select select select select select"
+    "brightness brightness brightness brightness brightness"
+    "transparency transparency transparency transparency transparency";
+  align-items: center;
+  gap: 10px;
+  flex: 0 0 auto;
+  margin-bottom: 14px;
+  padding: 13px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--surface);
+}
+
+.wallpaper-copy { grid-area: copy; min-width: 0; }
+.wallpaper-copy strong, .wallpaper-copy small { display: block; }
+.wallpaper-copy strong { font-size: 13px; }
+.wallpaper-copy small { margin-top: 4px; color: var(--muted); font-size: 11px; line-height: 1.35; }
+.wallpaper-project-groups {
+  grid-area: select;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  min-width: 0;
+}
+.wallpaper-project-group {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--surface-2) 76%, transparent);
+}
+.wallpaper-project-group > span { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; min-width: 0; }
+.wallpaper-project-group strong { overflow: hidden; font-size: 11px; white-space: nowrap; text-overflow: ellipsis; }
+.wallpaper-project-group small { flex: 0 0 auto; color: var(--muted); font-size: 10px; white-space: nowrap; }
+.wallpaper-project-group .wallpaper-desktop-sync-note {
+  color: var(--accent);
+  line-height: 1.35;
+  white-space: normal;
+}
+.wallpaper-import select {
+  width: 100%;
+  min-width: 0;
+  height: 38px;
+  padding: 0 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  outline: 0;
+  color: var(--ink);
+  background: var(--surface-2);
+  font: inherit;
+  font-size: 12px;
+}
+.wallpaper-import select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.wallpaper-import select:disabled { opacity: 0.55; }
+.wallpaper-import > .button.ghost { grid-area: rescan; }
+.wallpaper-import > .button.secondary { grid-area: apply; }
+.wallpaper-opacity {
+  display: grid;
+  grid-template-columns: minmax(120px, auto) minmax(160px, 1fr);
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+.wallpaper-brightness { grid-area: brightness; }
+.wallpaper-interface-transparency { grid-area: transparency; }
+.wallpaper-opacity span { display: flex; justify-content: space-between; gap: 8px; white-space: nowrap; }
+.wallpaper-opacity output { color: var(--ink); font-weight: 700; }
+.wallpaper-opacity input { width: 100%; accent-color: var(--accent); cursor: pointer; }
+.wallpaper-opacity input:disabled { cursor: default; opacity: 0.55; }
 
 .section-head { display: flex; align-items: baseline; gap: 10px; flex: 0 0 auto; margin: 0 0 12px; }
 .section-head h1, .section-head h2 { margin: 0; font-size: 16px; font-weight: 700; letter-spacing: -0.01em; }
@@ -688,6 +767,8 @@ button:focus-visible {
 .setting-row > div { min-width: 0; }
 .setting-row strong { font-size: 14px; }
 .setting-row p { margin: 4px 0 0; color: var(--muted); font-size: 12px; line-height: 1.55; }
+.repository-input { width: 250px; height: 38px; padding: 0 11px; border: 1px solid var(--line-strong); border-radius: 9px; outline: 0; color: var(--ink); background: var(--surface-2); font: inherit; font-size: 13px; }
+.repository-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 .path-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .switch { position: relative; flex: 0 0 auto; width: 40px; height: 24px; padding: 0; border: 1px solid var(--line-strong); border-radius: 999px; background: var(--surface-2); cursor: pointer; transition: background 140ms ease, border-color 140ms ease; }
 .switch span { position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%; background: var(--ink); opacity: 0.55; box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2); transition: transform 140ms ease, background 140ms ease, opacity 140ms ease; }
