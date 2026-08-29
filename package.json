@@ -1,7 +1,7 @@
 {
   "name": "retheme-we",
   "private": true,
-  "version": "0.4.7",
+  "version": "0.4.8",
   "license": "BSD-3-Clause",
   "packageManager": "pnpm@10.31.0",
   "type": "module",

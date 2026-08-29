@@ -35,11 +35,11 @@ use crate::{compatibility, theme};
 const CODEX_BUNDLE_ID: &str = "com.openai.codex";
 #[cfg(target_os = "windows")]
 const CODEX_PACKAGE_NAME: &str = "OpenAI.Codex";
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_ISOLATED_START_ATTEMPTS: usize = 2;
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
+const MAX_ISOLATED_START_ATTEMPTS: usize = 1;
 const THEME_CHANNEL_IO_TIMEOUT: Duration = Duration::from_secs(3);
 const TARGET_READY_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
-const TARGET_READY_STABILITY: Duration = Duration::from_millis(300);
+const TARGET_READY_STABILITY: Duration = Duration::from_secs(8);
 const STATUS_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 const STATUS_PROBE_GRACE_PERIOD: Duration = Duration::from_secs(15);
 const PAGE_LEASE_DURATION: Duration = Duration::from_secs(15);
@@ -674,6 +674,25 @@ struct DevToolsTarget {
     web_socket_debugger_url: String,
 }
 
+struct StableCodexTarget {
+    target: DevToolsTarget,
+    channel: WebSocket<TcpStream>,
+}
+
+impl StableCodexTarget {
+    fn into_parts(self) -> (DevToolsTarget, WebSocket<TcpStream>) {
+        (self.target, self.channel)
+    }
+}
+
+impl std::ops::Deref for StableCodexTarget {
+    type Target = DevToolsTarget;
+
+    fn deref(&self) -> &Self::Target {
+        &self.target
+    }
+}
+
 #[cfg_attr(all(target_os = "windows", not(test)), allow(dead_code))]
 enum IsolatedProcess {
     Native {
@@ -699,6 +718,7 @@ struct TestInstance {
 struct ThemeSession {
     id: u64,
     instance: TestInstance,
+    _target_channel: Option<WebSocket<TcpStream>>,
     _asset_server: Option<ThemeAssetServer>,
     _scene_frame_pump: Option<SceneFramePump>,
     port: u16,
@@ -717,27 +737,31 @@ struct SceneFramePump {
 
 impl SceneFramePump {
     fn start(
-        port: u16,
         session_id: u64,
         capture: Arc<crate::wallpaper_engine::SceneWallpaperCapture>,
+        mut channel: WebSocket<TcpStream>,
     ) -> Result<Self, CodexError> {
-        let capture_mode = capture.mode().as_str();
+        channel
+            .get_mut()
+            .set_read_timeout(Some(Duration::from_secs(2)))?;
+        channel
+            .get_mut()
+            .set_write_timeout(Some(Duration::from_secs(2)))?;
+        enable_scene_frame_channel(&mut channel, session_id, capture.mode().as_str())?;
+        channel
+            .get_mut()
+            .set_read_timeout(Some(Duration::from_millis(1)))?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = shutdown.clone();
         let thread = thread::Builder::new()
             .name("retheme-scene-frame-pump".into())
             .spawn(move || {
-                run_scene_frame_pump(capture, thread_shutdown, port, session_id);
+                run_scene_frame_pump(capture, thread_shutdown, channel, session_id);
             })?;
-        let mut pump = Self {
+        Ok(Self {
             shutdown,
             thread: Some(thread),
-        };
-        if let Err(error) = enable_scene_frame_channel(port, session_id, capture_mode) {
-            pump.stop();
-            return Err(error);
-        }
-        Ok(pump)
+        })
     }
 
     fn stop(&mut self) {
@@ -757,58 +781,45 @@ impl Drop for SceneFramePump {
 fn run_scene_frame_pump(
     capture: Arc<crate::wallpaper_engine::SceneWallpaperCapture>,
     shutdown: Arc<AtomicBool>,
-    port: u16,
+    mut channel: WebSocket<TcpStream>,
     session_id: u64,
 ) {
     let mut worker = crate::wallpaper_engine::SceneWallpaperCapture::capture_worker();
-    let mut socket: Option<WebSocket<TcpStream>> = None;
     let mut command_id = 10_000_u64;
+    let mut last_sequence = 0_u64;
     while !shutdown.load(Ordering::Acquire) {
-        if socket.is_none() {
-            socket = find_codex_target(port, Duration::from_millis(500))
-                .ok()
-                .flatten()
-                .and_then(|target| {
-                    connect_theme_channel_with_timeout(
-                        &target.web_socket_debugger_url,
-                        Duration::from_secs(1),
-                    )
-                    .ok()
-                });
-            if socket.is_none() {
-                thread::sleep(Duration::from_millis(250));
-                continue;
-            }
+        let frame_started = Instant::now();
+        if !drain_scene_frame_responses(&mut channel) {
+            break;
         }
         if capture.is_paused() {
             thread::sleep(Duration::from_millis(100));
             continue;
         }
-        let frame_started = Instant::now();
         let frame = match capture.capture_jpeg(&mut worker) {
             Ok(frame) => frame,
             Err(_) => {
-                thread::sleep(Duration::from_millis(250));
+                thread::sleep(Duration::from_millis(100));
                 continue;
             }
         };
-        let encoded_frame = BASE64_STANDARD.encode(frame.jpeg.as_ref());
-        let expression = format!(
-            "window.__codexThemeRuntime?.sessionId === {session_id} && window.__codexThemeRuntime?.pushSceneFrame?.('{encoded_frame}', {}) === true",
-            frame.sequence
-        );
-        command_id = command_id.wrapping_add(1).max(10_000);
-        let sent = socket.as_mut().is_some_and(|socket| {
-            send_cdp_command(
-                socket,
-                command_id,
-                "Runtime.evaluate",
-                json!({ "expression": expression, "returnByValue": true }),
-            )
-            .is_ok()
-        });
-        if !sent {
-            socket = None;
+        if frame.sequence != last_sequence {
+            let encoded_frame = BASE64_STANDARD.encode(frame.jpeg.as_ref());
+            let expression = format!(
+                "window.__codexThemeRuntime?.sessionId === {session_id} && window.__codexThemeRuntime?.pushSceneFrame?.('{encoded_frame}', {}) === true",
+                frame.sequence
+            );
+            command_id = command_id.wrapping_add(1).max(10_000);
+            let command = json!({
+                "id": command_id,
+                "method": "Runtime.evaluate",
+                "params": { "expression": expression, "returnByValue": true }
+            })
+            .to_string();
+            if channel.send(Message::Text(command.into())).is_err() {
+                break;
+            }
+            last_sequence = frame.sequence;
         }
         let remaining = crate::wallpaper_engine::SceneWallpaperCapture::frame_interval()
             .saturating_sub(frame_started.elapsed());
@@ -816,21 +827,52 @@ fn run_scene_frame_pump(
             thread::sleep(remaining);
         }
     }
+    let _ = channel.close(None);
 }
 
-fn enable_scene_frame_channel(
-    port: u16,
+fn drain_scene_frame_responses(channel: &mut WebSocket<TcpStream>) -> bool {
+    for _ in 0..4 {
+        match channel.read() {
+            Ok(Message::Close(_)) => return false,
+            Ok(message) if message.is_text() => {
+                let Ok(response) = serde_json::from_str::<Value>(message.to_text().unwrap_or(""))
+                else {
+                    return false;
+                };
+                if response.get("error").is_some()
+                    || response.pointer("/result/exceptionDetails").is_some()
+                {
+                    return false;
+                }
+            }
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return true;
+            }
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+fn enable_scene_frame_channel<S>(
+    channel: &mut tungstenite::WebSocket<S>,
     session_id: u64,
     capture_mode: &str,
-) -> Result<(), CodexError> {
-    let target = find_codex_target(port, Duration::from_secs(2))?
-        .ok_or_else(|| CodexError("找不到 ChatGPT Scene 帧页面".into()))?;
-    let mut socket = connect_theme_channel(&target.web_socket_debugger_url)?;
+) -> Result<(), CodexError>
+where
+    S: Read + Write,
+{
     let encoded_capture_mode = serde_json::to_string(capture_mode)
         .map_err(|error| CodexError(format!("无法编码 Scene 抓取模式：{error}")))?;
     let attached = evaluate_value(
-        &mut socket,
-        1,
+        channel,
+        9_999,
         &format!(
             r#"(() => {{
               const runtime = window.__codexThemeRuntime;
@@ -842,7 +884,6 @@ fn enable_scene_frame_channel(
     )?
     .as_bool()
     .unwrap_or(false);
-    let _ = socket.close(None);
     attached
         .then_some(())
         .ok_or_else(|| CodexError("ChatGPT 没有启用 Scene 内存帧通道".into()))
@@ -1298,6 +1339,7 @@ fn write_theme_asset_error(
 #[derive(Clone)]
 pub struct ThemeRuntime {
     session: std::sync::Arc<std::sync::Mutex<Option<ThemeSession>>>,
+    startup: std::sync::Arc<std::sync::Mutex<()>>,
     next_session_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -1305,12 +1347,19 @@ impl Default for ThemeRuntime {
     fn default() -> Self {
         Self {
             session: Default::default(),
+            startup: Default::default(),
             next_session_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
         }
     }
 }
 
 impl ThemeRuntime {
+    fn lock_startup(&self) -> Result<std::sync::MutexGuard<'_, ()>, CodexError> {
+        self.startup
+            .lock()
+            .map_err(|_| CodexError("ChatGPT 启动状态已损坏".into()))
+    }
+
     pub fn current_preview(&self) -> Result<Option<ThemePreviewReport>, CodexError> {
         let mut session = self
             .session
@@ -1520,18 +1569,83 @@ impl WindowsStoreProcess {
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
 
-        if self.has_exited().unwrap_or(true) {
-            return;
-        }
+        let descendants = windows_process_descendants(self.id);
         let handle = HANDLE(self.handle.as_raw_handle());
-        let _ = unsafe { TerminateProcess(handle, 0) };
-        let _ = unsafe {
-            WaitForSingleObject(
-                handle,
-                PROCESS_SHUTDOWN_TIMEOUT.as_millis().min(u32::MAX as u128) as u32,
-            )
-        };
+        if !self.has_exited().unwrap_or(true) {
+            let _ = unsafe { TerminateProcess(handle, 0) };
+            let _ = unsafe {
+                WaitForSingleObject(
+                    handle,
+                    PROCESS_SHUTDOWN_TIMEOUT.as_millis().min(u32::MAX as u128) as u32,
+                )
+            };
+        }
+        // Store 版 ChatGPT 的 Chromium 子进程不会在主进程退出时自动结束。
+        // 只终止由本次隔离根进程派生出的进程，避免残留窗口和临时配置目录。
+        for process_id in descendants.into_iter().rev() {
+            terminate_windows_process(process_id);
+        }
     }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_process_descendants(root_process_id: u32) -> Vec<u32> {
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
+        return Vec::new();
+    };
+    let _snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot.0) };
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    if unsafe { Process32FirstW(snapshot, &mut entry) }.is_err() {
+        return Vec::new();
+    }
+    let mut processes = Vec::new();
+    loop {
+        processes.push((entry.th32ProcessID, entry.th32ParentProcessID));
+        if unsafe { Process32NextW(snapshot, &mut entry) }.is_err() {
+            break;
+        }
+    }
+
+    let mut family = vec![root_process_id];
+    loop {
+        let mut changed = false;
+        for (process_id, parent_process_id) in &processes {
+            if family.contains(parent_process_id) && !family.contains(process_id) {
+                family.push(*process_id);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    family.remove(0);
+    family
+}
+
+#[cfg(target_os = "windows")]
+fn terminate_windows_process(process_id: u32) {
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+    };
+
+    let Ok(handle) =
+        (unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, false, process_id) })
+    else {
+        return;
+    };
+    let owned_handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+    let handle = windows::Win32::Foundation::HANDLE(owned_handle.as_raw_handle());
+    let _ = unsafe { TerminateProcess(handle, 0) };
+    let _ = unsafe { WaitForSingleObject(handle, 500) };
 }
 
 #[cfg(target_os = "macos")]
@@ -1687,8 +1801,13 @@ pub fn run_smoke_test() -> Result<SmokeTestReport, CodexError> {
 }
 
 pub fn run_compatibility_self_check(
+    runtime: &ThemeRuntime,
     compatibility: &compatibility::CompatibilityRepository,
 ) -> Result<SmokeTestReport, CodexError> {
+    let _startup = runtime.lock_startup()?;
+    if runtime.current_preview()?.is_some() {
+        return Err(CodexError("主题运行期间不重复打开兼容自检窗口".into()));
+    }
     let installation = detect()?;
     let adapter = compatibility.adapter(&installation.version);
     run_smoke_test_with_adapter(installation, adapter)
@@ -1746,8 +1865,8 @@ fn run_smoke_test_attempt(
         missing_adapter_probes,
         compatible,
         port,
-        target_title: target.title,
-        target_url: target.url,
+        target_title: target.title.clone(),
+        target_url: target.url.clone(),
         loopback_only,
         probe_applied,
         probe_removed,
@@ -1856,6 +1975,10 @@ fn start_theme_package_preview(
     locale: &str,
     controls_store: Option<WallpaperControlsStore>,
 ) -> Result<ThemePreviewReport, CodexError> {
+    let _startup = runtime.lock_startup()?;
+    if runtime.current_preview()?.is_some() {
+        return Err(CodexError("已有主题预览正在运行，请先恢复当前主题".into()));
+    }
     let installation = detect()?;
     let adapter = compatibility.adapter(&installation.version);
 
@@ -1895,7 +2018,8 @@ fn start_theme_package_preview_attempt(
     let (port, _) = wait_for_devtools(instance._profile.path(), &mut instance.process)?;
     let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     let loopback_only = verify_loopback(socket, instance.process.id())?;
-    let target = wait_for_codex_target(port, &mut instance.process)?;
+    let stable_target = wait_for_codex_target(port, &mut instance.process)?;
+    let (target, target_channel) = stable_target.into_parts();
     let session_id = runtime.next_session_id();
     let remaining = expires_at.map(remaining_until).transpose()?.flatten();
     let local_wallpaper_file = package.wallpaper_file_path().map(Path::to_path_buf);
@@ -1915,6 +2039,20 @@ fn start_theme_package_preview_attempt(
     {
         wallpaper["controlUrl"] = Value::String(controls_url);
     }
+    if scene_capture.is_some()
+        && let Some(wallpaper) = runtime_config.get_mut("wallpaper")
+    {
+        wallpaper["captureMode"] = Value::String(
+            scene_capture
+                .as_ref()
+                .map(|capture| capture.mode().as_str())
+                .unwrap_or("desktop-synchronized-offscreen")
+                .to_owned(),
+        );
+        wallpaper["frameIntervalMs"] = Value::from(
+            crate::wallpaper_engine::SceneWallpaperCapture::frame_interval().as_millis() as u64,
+        );
+    }
     let (applied_slots, apply_expression) = apply_theme(
         &target.web_socket_debugger_url,
         &package,
@@ -1931,9 +2069,14 @@ fn start_theme_package_preview_attempt(
     if let Some(wallpaper_path) = local_wallpaper_file.as_deref() {
         attach_local_wallpaper_file(&target.web_socket_debugger_url, session_id, wallpaper_path)?;
     }
-    let scene_frame_pump = scene_capture
-        .map(|capture| SceneFramePump::start(port, session_id, capture))
-        .transpose()?;
+    let (target_channel, scene_frame_pump) = if let Some(capture) = scene_capture {
+        (
+            None,
+            Some(SceneFramePump::start(session_id, capture, target_channel)?),
+        )
+    } else {
+        (Some(target_channel), None)
+    };
     let report = ThemePreviewReport {
         theme_id: package.id().to_owned(),
         theme: package.preview_summary(),
@@ -1955,6 +2098,7 @@ fn start_theme_package_preview_attempt(
     *session = Some(ThemeSession {
         id: session_id,
         instance,
+        _target_channel: target_channel,
         _asset_server: Some(asset_server),
         _scene_frame_pump: scene_frame_pump,
         port,
@@ -2157,6 +2301,12 @@ pub fn stop_theme_preview(runtime: &ThemeRuntime) -> Result<bool, CodexError> {
     let Some(mut session) = session else {
         return Ok(false);
     };
+
+    // The Scene pump owns the stable CDP connection. Close it before opening a
+    // cleanup connection so Chromium never has two competing theme channels.
+    if let Some(mut pump) = session._scene_frame_pump.take() {
+        pump.stop();
+    }
 
     if session.instance.process.has_exited()? {
         return Ok(true);
@@ -2476,7 +2626,7 @@ fn apply_theme(
             const media = document.createElement(
               mediaType === 'video' ? 'video'
                 : mediaType === 'web' ? 'iframe'
-                  : mediaType === 'scene' ? 'canvas' : 'img'
+                  : 'img'
             );
             if (media instanceof HTMLVideoElement) {{
               media.autoplay = true;
@@ -2492,16 +2642,18 @@ fn apply_theme(
               media.setAttribute('referrerpolicy', 'no-referrer');
               media.setAttribute('allow', '');
               media.tabIndex = -1;
-              media.addEventListener('load', () => {{ media.dataset.ctWebLoaded = 'true'; }});
-            }} else if (media instanceof HTMLCanvasElement) {{
+              media.addEventListener('load', () => {{
+                media.dataset.ctWebLoaded = 'true';
+              }});
+            }} else if (mediaType === 'scene') {{
               media.dataset.ctSceneSource = assetUrl;
-              media.width = 16;
-              media.height = 9;
+              media.alt = '';
+              media.draggable = false;
             }} else {{
               media.alt = '';
               media.draggable = false;
             }}
-            if (!(media instanceof HTMLCanvasElement)) media.src = assetUrl;
+            if (mediaType !== 'scene') media.src = assetUrl;
             mount.appendChild(media);
             if (media instanceof HTMLVideoElement) void media.play().catch(() => {{}});
             return mount;
@@ -2653,7 +2805,8 @@ fn apply_theme(
               }}
             }}
             if (config.wallpaper?.kind === 'scene') {{
-              if (!wallpaperPlaybackPaused) startSceneFrameLoop();
+              if (wallpaperPlaybackPaused) stopSceneFrameLoop();
+              else startSceneFrameLoop();
               persistWallpaperControls();
             }}
             syncWallpaperControlsMount();
@@ -2731,9 +2884,7 @@ fn apply_theme(
             configuredAssets.map(asset => [asset.slot, asset])
           );
 
-          let sceneFrameDecodeInFlight = false;
-          let sceneFramePending = null;
-          let sceneFrameStopped = false;
+          let sceneFrameStopped = true;
           let sceneFrameSequence = 0;
           const sceneFrameStats = {{
             decodedFrames: 0,
@@ -2742,73 +2893,49 @@ fn apply_theme(
             receivedFrames: 0,
             startedAt: 0,
             lastFrameDurationMs: 0,
-            lastError: null
+            lastError: null,
+            framesPerSecond: 0,
+            sequence: 0,
+            width: 0,
+            height: 0
           }};
-          const renderSceneFrame = async frame => {{
-            if (sceneFrameStopped || sceneFrameDecodeInFlight || assetsRevoked) return;
-            const {{ payload, sequence }} = frame;
-            const canvas = document.querySelector(
-              '[data-ct-mount="app.background"] canvas[data-ct-scene-source]'
+          const pushSceneFrame = (encodedFrame, sequence) => {{
+            if (
+              typeof encodedFrame !== 'string' || !encodedFrame
+              || wallpaperPlaybackPaused || sceneFrameStopped || assetsRevoked
+            ) return false;
+            const image = document.querySelector(
+              '[data-ct-mount="app.background"] img[data-ct-scene-source]'
             );
-            if (!(canvas instanceof HTMLCanvasElement)) return;
-            sceneFrameDecodeInFlight = true;
+            if (!(image instanceof HTMLImageElement)) return false;
+            if (image.dataset.ctScenePending === 'true') {{
+              sceneFrameStats.droppedFrames += 1;
+            }}
+            image.dataset.ctScenePending = 'true';
             const started = performance.now();
-            try {{
-              const bitmap = await createImageBitmap(
-                new Blob([payload], {{ type: 'image/jpeg' }})
-              );
-              if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {{
-                canvas.width = bitmap.width;
-                canvas.height = bitmap.height;
-              }}
-              const bitmapContext = canvas.getContext('bitmaprenderer');
-              if (bitmapContext) {{
-                bitmapContext.transferFromImageBitmap(bitmap);
-              }} else {{
-                const context = canvas.getContext('2d', {{ alpha: false }});
-                context?.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-                bitmap.close();
-              }}
+            image.onload = () => {{
+              image.dataset.ctScenePending = 'false';
               if (!sceneFrameStats.startedAt) sceneFrameStats.startedAt = performance.now();
               sceneFrameStats.decodedFrames += 1;
               sceneFrameStats.lastError = null;
               sceneFrameSequence = Number.isFinite(Number(sequence))
                 ? Number(sequence)
                 : sceneFrameSequence + 1;
-              canvas.dataset.ctSceneReady = 'true';
-              canvas.dataset.ctSceneFrame = String(sceneFrameSequence);
-            }} catch (error) {{
-              sceneFrameStats.failedRequests += 1;
-              sceneFrameStats.lastError = String(error);
-            }} finally {{
-              sceneFrameDecodeInFlight = false;
+              sceneFrameStats.sequence = sceneFrameSequence;
+              sceneFrameStats.width = image.naturalWidth;
+              sceneFrameStats.height = image.naturalHeight;
               sceneFrameStats.lastFrameDurationMs = performance.now() - started;
-              const pending = sceneFramePending;
-              sceneFramePending = null;
-              if (pending && !wallpaperPlaybackPaused && !sceneFrameStopped) {{
-                void renderSceneFrame(pending);
-              }}
-            }}
-          }};
-          const queueSceneFrame = (payload, sequence) => {{
-            if (wallpaperPlaybackPaused || sceneFrameStopped || assetsRevoked) return;
-            const frame = {{ payload, sequence }};
-            if (sceneFrameDecodeInFlight) {{
-              sceneFramePending = frame;
-              sceneFrameStats.droppedFrames += 1;
-              return;
-            }}
-            void renderSceneFrame(frame);
-          }};
-          const pushSceneFrame = (encodedFrame, sequence) => {{
-            if (typeof encodedFrame !== 'string' || !encodedFrame) return false;
-            const binary = atob(encodedFrame);
-            const payload = new Uint8Array(binary.length);
-            for (let index = 0; index < binary.length; index += 1) {{
-              payload[index] = binary.charCodeAt(index);
-            }}
+              image.dataset.ctSceneReady = 'true';
+              image.dataset.ctSceneFrame = String(sceneFrameSequence);
+            }};
+            image.onerror = () => {{
+              image.dataset.ctScenePending = 'false';
+              sceneFrameStats.failedRequests += 1;
+              sceneFrameStats.lastError = 'Scene JPEG decode failed';
+              sceneFrameStats.lastFrameDurationMs = performance.now() - started;
+            }};
             sceneFrameStats.receivedFrames += 1;
-            queueSceneFrame(payload, sequence);
+            image.src = `data:image/jpeg;base64,${{encodedFrame}}`;
             return true;
           }};
           startSceneFrameLoop = () => {{
@@ -2818,7 +2945,6 @@ fn apply_theme(
           }};
           stopSceneFrameLoop = () => {{
             sceneFrameStopped = true;
-            sceneFramePending = null;
           }};
           const getScenePlaybackStats = () => {{
             const elapsed = sceneFrameStats.startedAt
@@ -2828,7 +2954,9 @@ fn apply_theme(
               ...sceneFrameStats,
               framesPerSecond: elapsed ? sceneFrameStats.decodedFrames / elapsed : 0,
               sequence: sceneFrameSequence,
-              inFlight: sceneFrameDecodeInFlight,
+              inFlight: document.querySelector(
+                '[data-ct-mount="app.background"] img[data-ct-scene-pending="true"]'
+              ) instanceof HTMLImageElement,
               stopped: sceneFrameStopped
             }};
           }};
@@ -2837,8 +2965,8 @@ fn apply_theme(
             if (config.wallpaper?.kind === 'scene') {{
               startSceneFrameLoop();
               return document.querySelector(
-                '[data-ct-mount="app.background"] canvas[data-ct-scene-ready="true"]'
-              ) instanceof HTMLCanvasElement;
+                '[data-ct-mount="app.background"] img[data-ct-scene-ready="true"]'
+              ) instanceof HTMLImageElement;
             }}
             if (config.wallpaper?.kind === 'web') {{
               return document.querySelector(
@@ -2925,7 +3053,10 @@ fn apply_theme(
                 const asset = assetsBySlot.get(mount.getAttribute('data-ct-mount'));
                 const assetUrl = assetUrlForScheme(asset);
                 const media = mount.querySelector('img, video, iframe');
-                if (media && assetUrl && media.src !== assetUrl) {{
+                if (
+                  media && assetUrl && media.src !== assetUrl
+                  && !media.hasAttribute('data-ct-scene-source')
+                ) {{
                   media.src = assetUrl;
                 }}
               }});
@@ -2949,9 +3080,10 @@ fn apply_theme(
               else parent.appendChild(mount);
             }} else {{
               mount.dataset.ctSlot = slot;
-              const media = mount.querySelector('img, video, iframe, canvas');
-              if (media instanceof HTMLCanvasElement) {{
+              const media = mount.querySelector('img, video, iframe');
+              if (asset.mediaType === 'scene' && media instanceof HTMLIFrameElement) {{
                 media.dataset.ctSceneSource = assetUrl;
+                if (media.src !== assetUrl) media.src = assetUrl;
               }} else if (media && media.src !== assetUrl) {{
                 media.src = assetUrl;
               }}
@@ -5019,6 +5151,7 @@ fn apply_theme(
             setWallpaperPlaybackPaused,
             getScenePlaybackStats,
             pushSceneFrame,
+            sceneCaptureMode: config.wallpaper?.captureMode ?? null,
             startSceneFrameLoop,
             stopSceneFrameLoop,
             getWallpaperPlaybackState: () => ({{
@@ -5468,54 +5601,58 @@ fn renew_theme_lease_expression(session_id: u64, duration: Duration) -> String {
 fn wait_for_codex_target(
     port: u16,
     process: &mut IsolatedProcess,
-) -> Result<DevToolsTarget, CodexError> {
+) -> Result<StableCodexTarget, CodexError> {
     let started = Instant::now();
-    let mut stable_target = None::<(String, Instant)>;
+    let mut stable_target = None::<(DevToolsTarget, WebSocket<TcpStream>, Instant, u64)>;
     while started.elapsed() < STARTUP_TIMEOUT {
         if process.has_exited()? {
             return Err(CodexError("隔离 ChatGPT 提前退出".into()));
         }
-        if let Ok(Some(target)) = find_codex_target(port, Duration::from_millis(500)) {
-            // `/json/list` 会在新版 ChatGPT 的页面仍处于 about:blank 时提前把
-            // target URL 报成 app://-/index.html。此时立刻注入，导航会销毁执行
-            // 上下文，CDP 命令可能一直等到套接字超时。必须以页面内部报告的
-            // location/readyState 为准，并要求同一个 target 短暂稳定后再使用。
-            if codex_target_document_ready(&target.web_socket_debugger_url).unwrap_or(false) {
-                match &stable_target {
-                    Some((url, since))
-                        if url == &target.web_socket_debugger_url
-                            && since.elapsed() >= TARGET_READY_STABILITY =>
-                    {
-                        return Ok(target);
-                    }
-                    Some((url, _)) if url == &target.web_socket_debugger_url => {}
-                    _ => {
-                        stable_target =
-                            Some((target.web_socket_debugger_url.clone(), Instant::now()));
-                    }
+        if let Some((_, channel, since, command_id)) = stable_target.as_mut() {
+            *command_id += 1;
+            if codex_target_document_ready_on_channel(channel, *command_id).unwrap_or(false) {
+                if since.elapsed() >= TARGET_READY_STABILITY {
+                    let (target, channel, _, _) = stable_target.take().expect("stable target");
+                    return Ok(StableCodexTarget { target, channel });
                 }
             } else {
                 stable_target = None;
             }
+        } else if let Ok(Some(target)) = find_codex_target(port, Duration::from_millis(500)) {
+            // `/json/list` 会在新版 ChatGPT 的页面仍处于 about:blank 时提前把
+            // target URL 报成 app://-/index.html。保持一条 CDP 通道并以页面内部
+            // 报告的 location/readyState 为准，既能识别后续导航，也避免新版
+            // ChatGPT 在最后一条调试连接断开时回收刚创建的主页面目标。
+            if let Ok(mut channel) = connect_theme_channel_with_timeout(
+                &target.web_socket_debugger_url,
+                TARGET_READY_PROBE_TIMEOUT,
+            ) && codex_target_document_ready_on_channel(&mut channel, 1).unwrap_or(false)
+            {
+                stable_target = Some((target, channel, Instant::now(), 1));
+            }
         }
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(250));
     }
     Err(CodexError("等待稳定的 ChatGPT 页面目标超时".into()))
 }
 
-fn codex_target_document_ready(websocket_url: &str) -> Result<bool, CodexError> {
-    let mut socket = connect_theme_channel_with_timeout(websocket_url, TARGET_READY_PROBE_TIMEOUT)?;
-    let value = evaluate_value(
-        &mut socket,
-        1,
+fn codex_target_document_ready_on_channel<S>(
+    socket: &mut tungstenite::WebSocket<S>,
+    id: u64,
+) -> Result<bool, CodexError>
+where
+    S: Read + Write,
+{
+    evaluate_value(
+        socket,
+        id,
         r#"(() => ({
           url: location.href,
           readyState: document.readyState,
           hasDocument: Boolean(document.documentElement && document.body)
         }))()"#,
-    );
-    let _ = socket.close(None);
-    value.map(|value| codex_target_document_ready_value(&value))
+    )
+    .map(|value| codex_target_document_ready_value(&value))
 }
 
 fn codex_target_document_ready_value(value: &Value) -> bool {
@@ -6071,6 +6208,15 @@ where
 mod tests {
     use super::*;
 
+    #[test]
+    fn theme_runtime_allows_only_one_isolated_startup() {
+        let runtime = ThemeRuntime::default();
+        let startup = runtime.lock_startup().expect("first startup lock");
+        assert!(runtime.startup.try_lock().is_err());
+        drop(startup);
+        assert!(runtime.startup.try_lock().is_ok());
+    }
+
     #[cfg(target_os = "macos")]
     fn external_test_theme() -> PathBuf {
         std::env::var_os("RETHEME_TEST_THEME_DIR")
@@ -6096,6 +6242,7 @@ mod tests {
         *runtime.session.lock().expect("theme session") = Some(ThemeSession {
             id: 1,
             instance,
+            _target_channel: None,
             _asset_server: None,
             _scene_frame_pump: None,
             port,
@@ -7047,19 +7194,18 @@ mod tests {
     }
 
     #[test]
-    fn wallpaper_runtime_streams_scene_frames_to_a_canvas_and_sandboxes_web_iframes() {
+    fn wallpaper_runtime_streams_scene_frames_to_an_image_and_sandboxes_web_iframes() {
         let source = include_str!("codex.rs");
         for fragment in [
             "['video', 'scene', 'web'].includes(config.wallpaper?.kind)",
-            "mediaType === 'scene' ? 'canvas' : 'img'",
+            "mediaType === 'web' ? 'iframe'",
             "media.setAttribute('sandbox', 'allow-scripts')",
-            "[data-ct-mount=\"app.background\"] canvas[data-ct-scene-source]",
+            "[data-ct-mount=\"app.background\"] img[data-ct-scene-source]",
             "retheme-scene-frame-pump",
             "BASE64_STANDARD.encode(frame.jpeg.as_ref())",
             "pushSceneFrame?.('{encoded_frame}'",
-            "const binary = atob(encodedFrame)",
-            "new Blob([payload], {{ type: 'image/jpeg' }})",
-            "bitmapContext.transferFromImageBitmap(bitmap)",
+            "image.src = `data:image/jpeg;base64,${{encodedFrame}}`",
+            "image.dataset.ctSceneReady = 'true'",
             "sceneFrameStats.droppedFrames",
             "sceneFrameStats.receivedFrames",
             "getScenePlaybackStats",
@@ -7067,15 +7213,11 @@ mod tests {
             assert!(source.contains(fragment), "missing {fragment}");
         }
         let obsolete_frame_bridge = ["setScene", "WallpaperFrame"].concat();
-        let obsolete_base64_transport = ["data:image/jpeg", ";base64"].concat();
         let obsolete_mjpeg_transport = ["multipart/x-mixed", "retheme-frame"].concat();
         assert!(!source.contains(&obsolete_frame_bridge));
-        assert!(!source.contains(&obsolete_base64_transport));
         assert!(!source.contains(&obsolete_mjpeg_transport));
         let obsolete_scene_temp_file = ["scene-frame", "-a.jpg"].concat();
         assert!(!source.contains(&obsolete_scene_temp_file));
-        let obsolete_scene_fetch = ["fetch", "(url"].concat();
-        assert!(!source.contains(&obsolete_scene_fetch));
         let obsolete_scene_file_input = ["data-ct-scene", "-frame-input"].concat();
         assert!(!source.contains(&obsolete_scene_file_input));
     }
@@ -7887,6 +8029,7 @@ mod tests {
             wait_for_codex_target(session.port, &mut session.instance.process)
                 .expect("themed ChatGPT page")
                 .web_socket_debugger_url
+                .clone()
         };
         let playback = |id| {
             let mut socket = connect_theme_channel(&websocket_url).expect("theme channel");
@@ -7965,10 +8108,11 @@ mod tests {
                 .any(|slot| slot == "app.background")
         );
         let websocket_url = {
-            let mut session = runtime.session.lock().expect("theme session");
-            let session = session.as_mut().expect("active theme session");
-            wait_for_codex_target(session.port, &mut session.instance.process)
-                .expect("themed ChatGPT page")
+            let session = runtime.session.lock().expect("theme session");
+            let session = session.as_ref().expect("active theme session");
+            find_codex_target(session.port, Duration::from_secs(2))
+                .expect("themed ChatGPT target status")
+                .expect("themed ChatGPT target")
                 .web_socket_debugger_url
         };
         thread::sleep(Duration::from_secs(5));
@@ -7977,30 +8121,31 @@ mod tests {
             &mut socket,
             1,
             r#"(() => {
-              const canvas = document.querySelector(
-                '[data-ct-mount="app.background"] canvas[data-ct-scene-source]'
+              const sceneImage = document.querySelector(
+                '[data-ct-mount="app.background"] img[data-ct-scene-source]'
               );
               const iframe = document.querySelector(
                 '[data-ct-mount="app.background"] iframe[sandbox="allow-scripts"]'
               );
+              const sceneStats = window.__codexThemeRuntime?.getScenePlaybackStats?.() ?? null;
               return {
-                sceneReady: canvas instanceof HTMLCanvasElement
-                  && canvas.dataset.ctSceneReady === 'true'
-                  && canvas.width >= 1280 && canvas.height >= 720,
+                sceneReady: sceneImage instanceof HTMLImageElement
+                  && sceneImage.dataset.ctSceneReady === 'true'
+                  && sceneStats?.width >= 1280 && sceneStats?.height >= 720,
                 webReady: iframe instanceof HTMLIFrameElement
                   && iframe.dataset.ctWebLoaded === 'true',
-                sceneExists: canvas instanceof HTMLCanvasElement,
-                sceneWidth: canvas?.width ?? 0,
-                sceneHeight: canvas?.height ?? 0,
-                sceneFrame: canvas?.dataset.ctSceneFrame ?? null,
-                sceneStats: window.__codexThemeRuntime?.getScenePlaybackStats?.() ?? null,
+                sceneExists: sceneImage instanceof HTMLImageElement,
+                sceneSource: sceneImage?.dataset.ctSceneSource ?? null,
+                sceneWidth: sceneStats?.width ?? 0,
+                sceneHeight: sceneStats?.height ?? 0,
+                sceneFrame: sceneImage?.dataset.ctSceneFrame ?? null,
+                sceneStats,
                 sceneCaptureMode: window.__codexThemeRuntime?.sceneCaptureMode ?? null,
                 runtimeError: window.__codexThemeRuntime?.lastApplyError ?? null
               };
             })()"#,
         )
         .expect("non-video wallpaper state");
-        let _ = socket.close(None);
         assert_eq!(
             state[if project_type == "scene" {
                 "sceneReady"
@@ -8020,15 +8165,14 @@ mod tests {
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0);
             eprintln!(
-                "Scene canvas playback: decoded_frames={decoded_frames} fps={frames_per_second:.1} state={state}"
+                "Scene playback: decoded_frames={decoded_frames} fps={frames_per_second:.1} state={state}"
             );
             assert!(decoded_frames >= 3, "Scene frames did not advance: {state}");
             assert_eq!(
-                state["sceneCaptureMode"], "desktop-synchronized",
-                "Scene did not reuse the synchronized desktop renderer: {state}"
+                state["sceneCaptureMode"], "desktop-synchronized-offscreen",
+                "Scene did not synchronize the desktop wallpaper and start offscreen capture: {state}"
             );
 
-            let mut socket = connect_theme_channel(&websocket_url).expect("pause theme channel");
             assert!(
                 evaluate(
                     &mut socket,
@@ -8037,9 +8181,7 @@ mod tests {
                 )
                 .expect("pause Scene wallpaper")
             );
-            let _ = socket.close(None);
             thread::sleep(Duration::from_millis(500));
-            let mut socket = connect_theme_channel(&websocket_url).expect("paused theme channel");
             let paused_sequence = evaluate_value(
                 &mut socket,
                 3,
@@ -8048,9 +8190,7 @@ mod tests {
             .expect("paused Scene sequence")
             .as_u64()
             .unwrap_or(0);
-            let _ = socket.close(None);
             thread::sleep(Duration::from_secs(1));
-            let mut socket = connect_theme_channel(&websocket_url).expect("pause proof channel");
             let held_sequence = evaluate_value(
                 &mut socket,
                 4,
@@ -8071,9 +8211,7 @@ mod tests {
                 )
                 .expect("resume Scene wallpaper")
             );
-            let _ = socket.close(None);
             thread::sleep(Duration::from_secs(1));
-            let mut socket = connect_theme_channel(&websocket_url).expect("resume proof channel");
             let resumed_sequence = evaluate_value(
                 &mut socket,
                 6,
@@ -8082,7 +8220,6 @@ mod tests {
             .expect("resumed Scene sequence")
             .as_u64()
             .unwrap_or(0);
-            let _ = socket.close(None);
             assert!(
                 resumed_sequence > held_sequence,
                 "Scene wallpaper did not resume: paused={held_sequence}, resumed={resumed_sequence}"
@@ -8091,6 +8228,7 @@ mod tests {
                 "Scene pause/resume: paused={paused_sequence} held={held_sequence} resumed={resumed_sequence}"
             );
         }
+        let _ = socket.close(None);
         assert!(stop_theme_preview(&runtime).expect("stop dynamic wallpaper"));
     }
 

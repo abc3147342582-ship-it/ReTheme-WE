@@ -2,6 +2,22 @@
 
 All notable ReTheme desktop changes are documented here.
 
+## [0.4.8] - 2026-08-29
+
+### Fixed
+
+- Add one global isolated-start lock so automatic compatibility checks, theme application, and Wallpaper Engine application cannot open multiple ChatGPT windows concurrently.
+- Allow only one isolated launch attempt per application, require 8 continuous seconds of page stability, and extend the total startup timeout to 45 seconds, favoring a slower reliable launch over spawning another window.
+- Delay the automatic compatibility check for 8 seconds and cancel a pending check when the user starts applying a theme or wallpaper.
+- Terminate the isolated ChatGPT process tree so test pages cannot remain after cleanup.
+
+### Optimized
+
+- Reduce the Scene capture interval from 100 ms to 33 ms while preserving the native 2561×1601 frame size at JPEG quality 80; the original Scene test on this machine improved from about 10 FPS to a measured 15.0 FPS.
+- Synchronize the selected Scene to the Wallpaper Engine desktop, then capture a clean offscreen window. Together with a `ChatGPT.exe` maximized/pause application rule, only the offscreen instance keeps rendering while ChatGPT is maximized.
+- Send Scene frames over one CDP connection, skip duplicate frames, and close the frame channel before opening the cleanup connection.
+- Build libjpeg-turbo's Windows x64 SIMD path with official NASM 3.02 for the release package.
+
 ## [0.4.7] - 2026-08-28
 
 ### Fixed

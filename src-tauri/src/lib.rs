@@ -219,11 +219,13 @@ fn detect_codex() -> Result<CodexInstallation, String> {
 
 #[tauri::command]
 async fn run_cdp_smoke_test(
+    runtime: State<'_, ThemeRuntime>,
     compatibility: State<'_, CompatibilityRepository>,
 ) -> Result<SmokeTestReport, String> {
+    let runtime = runtime.inner().clone();
     let compatibility = compatibility.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        codex::run_compatibility_self_check(&compatibility)
+        codex::run_compatibility_self_check(&runtime, &compatibility)
     })
     .await
     .map_err(|error| format!("测试任务异常结束：{error}"))?

@@ -1,0 +1,2 @@
+set(CMAKE_SYSTEM_NAME Windows)
+set(CMAKE_SYSTEM_PROCESSOR AMD64 CACHE STRING "Windows x64 build architecture" FORCE)

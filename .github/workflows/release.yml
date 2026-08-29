@@ -33,6 +33,22 @@ jobs:
           cache: pnpm
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: 安装并校验官方 NASM 3.02
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "nasm-3.02-win64.zip"
+          $destination = Join-Path $env:RUNNER_TEMP "nasm-3.02"
+          Invoke-WebRequest -Uri "https://www.nasm.us/pub/nasm/releasebuilds/3.02/win64/nasm-3.02-win64.zip" -OutFile $archive
+          $actualHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
+          $expectedHash = "161D0BFAFF53C2F9E9F3E69FD0672323EBABAFD1268976A5CEC11BE92A19AEE7"
+          if ($actualHash -ne $expectedHash) {
+            throw "NASM 3.02 压缩包校验失败：$actualHash"
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination -Force
+          $nasmDirectory = (Resolve-Path (Join-Path $destination "nasm-3.02")).Path
+          $nasmDirectory >> $env:GITHUB_PATH
+          "CMAKE_TOOLCHAIN_FILE=$((Resolve-Path 'scripts/cmake-windows-x64-toolchain.cmake').Path)" >> $env:GITHUB_ENV
+
       - name: 确定版本
         id: version
         shell: pwsh

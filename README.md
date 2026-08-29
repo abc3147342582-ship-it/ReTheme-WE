@@ -14,7 +14,7 @@ ReTheme WE 是基于 [duxweb/ReTheme](https://github.com/duxweb/ReTheme) 的非�
 - 针对新版与旧版 ChatGPT 页面清理背景黑框、输入框阴影和不透明容器。
 - 支持指定 GitHub 仓库进行版本兼容自检和签名自动更新。
 
-Scene 壁纸当前通过 Windows Graphics Capture 抓取原版渲染画面，再以 JPEG 帧传入 ChatGPT。为控制 CPU、GPU 和传输占用，0.4.7 默认约 10 FPS；Video 与 Web 壁纸不受此 Scene 抓帧限制。
+Scene 壁纸会先同步为 Wallpaper Engine 的桌面壁纸，再通过 Windows Graphics Capture 抓取同一项目的纯净离屏画面并传入 ChatGPT。0.4.8 保留 2561×1601 原始尺寸和 JPEG 80，本机原版 Scene 实测 15.0 FPS；Video 与 Web 壁纸不受此 Scene 抓帧限制。为避免同一壁纸同时渲染两次，建议在 Wallpaper Engine 中配置 `ChatGPT.exe`「最大化时暂停」应用规则。
 
 ## 系统要求
 

@@ -1,6 +1,6 @@
 [package]
 name = "retheme-we"
-version = "0.4.7"
+version = "0.4.8"
 description = "A local Wallpaper Engine theme build for ChatGPT"
 authors = ["ReTheme"]
 license = "BSD-3-Clause"
@@ -48,7 +48,7 @@ tauri-plugin-process = "2.3.1"
 libc = "0.2.186"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.61.3", features = ["ApplicationModel", "ApplicationModel_Core", "Foundation_Collections", "Management_Deployment", "Storage", "Storage_Search", "Win32_Foundation", "Win32_System_Com", "Win32_System_Threading", "Win32_UI_Shell"] }
+windows = { version = "0.61.3", features = ["ApplicationModel", "ApplicationModel_Core", "Foundation_Collections", "Management_Deployment", "Storage", "Storage_Search", "Win32_Foundation", "Win32_System_Com", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading", "Win32_UI_Shell"] }
 turbojpeg = { version = "1.5.1", default-features = false, features = ["cmake"] }
 windows-capture = "2.0.1"
 windows-sys = { version = "0.59.0", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }

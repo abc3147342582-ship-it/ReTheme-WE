@@ -16,12 +16,13 @@
 可以推送 SemVer 标签：
 
 ```text
-git tag v0.4.7
+git tag v0.4.8
 git push origin main
-git push origin v0.4.7
+git push origin v0.4.8
 ```
 
 也可以从 GitHub Actions 手动运行 `Release ReTheme WE` 并填写版本号。工作流会同步所有版本文件、运行前端与 Rust 测试、构建签名 NSIS 安装包并发布公开 Release。
+Windows 工作流只从 NASM 官方发布目录下载 3.02 Win64 压缩包，并在解压前校验固定 SHA-256；该工具用于 libjpeg-turbo 的 x64 SIMD 构建。
 
 ## 本机预检
 

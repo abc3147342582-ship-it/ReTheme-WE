@@ -90,6 +90,7 @@ const COMPATIBILITY_CACHE_KEY = "retheme.compatibility-check.v2";
 const PREFERENCES_KEY = "retheme.preferences.v1";
 const UPDATE_REPOSITORY_KEY = "retheme.update-repository.v1";
 const WALLPAPER_PREFERENCES_KEY = "retheme.wallpaper-preferences.v1";
+const AUTOMATIC_SELF_CHECK_DELAY_MS = 8_000;
 
 type WallpaperPreferences = WallpaperControls & {
   projectPath: string;
@@ -246,6 +247,7 @@ type SharedPageProps = {
   busyThemeId: string;
   uninstallingThemeId: string;
   stopping: boolean;
+  testing: boolean;
   onDetect: () => void;
   onApplyTheme: (themeId: string) => void;
   onUninstallTheme: (theme: ThemeSummary) => void;
@@ -360,7 +362,7 @@ function ThemesPage(props: SharedPageProps & {
     <section className="page themes-page" aria-labelledby="themes-title">
       <div className="page-toolbar">
         <label className="toolbar-search"><span aria-hidden="true">⌕</span><input type="search" placeholder={t("themes.search")} aria-label={t("themes.search")} value={query} onChange={(event) => setQuery(event.target.value)} /></label>
-        <button className="button secondary" title={t("themes.localTitle")} disabled={props.localPreviewing || Boolean(props.previewReport) || !props.installation} onClick={props.onPreviewLocalTheme}>{props.localPreviewing ? t("common.loading") : t("themes.loadLocal")}</button>
+        <button className="button secondary" title={t("themes.localTitle")} disabled={props.testing || props.localPreviewing || Boolean(props.previewReport) || !props.installation} onClick={props.onPreviewLocalTheme}>{props.localPreviewing ? t("common.loading") : t("themes.loadLocal")}</button>
         <span className="toolbar-spacer" />
         <button className="button primary" disabled={!props.previewReport || props.stopping} onClick={props.onRestore}>{props.stopping ? t("common.restoring") : t("themes.restoreOfficial")}</button>
       </div>
@@ -457,7 +459,7 @@ function ThemesPage(props: SharedPageProps & {
           </button>
           <button
             className="button secondary"
-            disabled={!wallpaperPath || props.wallpaperPreviewing || Boolean(props.previewReport) || !props.installation}
+            disabled={props.testing || !wallpaperPath || props.wallpaperPreviewing || Boolean(props.previewReport) || !props.installation}
             onClick={() => props.onPreviewWallpaperEngine(wallpaperPath, {
               wallpaperBrightness,
               interfaceTransparency,
@@ -491,7 +493,7 @@ function ThemesPage(props: SharedPageProps & {
                     {active ? (
                       <button className="pill is-live" disabled={props.stopping || uninstalling} onClick={props.onRestore} aria-label={t("themes.restoreLabel", { name: theme.name })}><i />{props.stopping ? t("common.restoring") : t("themes.inUse")}</button>
                     ) : (
-                      <button className="pill" disabled={!props.installation || Boolean(props.busyThemeId) || props.stopping || Boolean(props.previewReport) || Boolean(props.uninstallingThemeId)} onClick={() => props.onApplyTheme(theme.id)} aria-label={t("themes.applyLabel", { name: theme.name })}>{busy ? t("common.applying") : t("common.apply")}</button>
+                      <button className="pill" disabled={props.testing || !props.installation || Boolean(props.busyThemeId) || props.stopping || Boolean(props.previewReport) || Boolean(props.uninstallingThemeId)} onClick={() => props.onApplyTheme(theme.id)} aria-label={t("themes.applyLabel", { name: theme.name })}>{busy ? t("common.applying") : t("common.apply")}</button>
                     )}
                   </div>
                 </div>
@@ -836,6 +838,7 @@ function App() {
   }
 
   async function startTheme(themeId: string) {
+    if (testing || localPreviewing || wallpaperPreviewing) return;
     previewMutation.current += 1;
     setBusyThemeId(themeId);
     setPreviewError("");
@@ -851,6 +854,7 @@ function App() {
   }
 
   async function previewLocalTheme() {
+    if (testing || localPreviewing || wallpaperPreviewing) return;
     previewMutation.current += 1;
     setLocalPreviewing(true);
     setPreviewError("");
@@ -888,6 +892,7 @@ function App() {
   }
 
   async function previewWallpaperEngine(projectPath: string, controls: WallpaperControls) {
+    if (testing || localPreviewing || wallpaperPreviewing) return;
     previewMutation.current += 1;
     setWallpaperPreviewing(true);
     setWallpaperError("");
@@ -972,7 +977,8 @@ function App() {
   }, [preferences.autoUpdate, updateRepository]);
 
   useEffect(() => {
-    if (!isDesktopRuntime() || !installation || !previewStatusReady || previewReport || testing) return;
+    if (!isDesktopRuntime() || !installation || !previewStatusReady || previewReport || testing
+      || Boolean(busyThemeId) || localPreviewing || wallpaperPreviewing || stopping) return;
     const cached = loadCompatibilityCheck(installation.version);
     if (cached) {
       setSmokeReport(cached.report ?? null);
@@ -980,9 +986,12 @@ function App() {
       return;
     }
     if (selfCheckVersion.current === installation.version) return;
-    selfCheckVersion.current = installation.version;
-    void smokeTest(true);
-  }, [installation?.version, previewStatusReady, previewReport]);
+    const timer = window.setTimeout(() => {
+      selfCheckVersion.current = installation.version;
+      void smokeTest(true);
+    }, AUTOMATIC_SELF_CHECK_DELAY_MS);
+    return () => window.clearTimeout(timer);
+  }, [installation?.version, previewStatusReady, previewReport, testing, busyThemeId, localPreviewing, wallpaperPreviewing, stopping]);
 
   useEffect(() => {
     if (!account.authenticated) {
@@ -1107,6 +1116,7 @@ function App() {
     busyThemeId,
     uninstallingThemeId,
     stopping,
+    testing,
     onDetect: () => void detect(),
     onApplyTheme: (themeId) => void startTheme(themeId),
     onUninstallTheme: (theme) => void removeTheme(theme),

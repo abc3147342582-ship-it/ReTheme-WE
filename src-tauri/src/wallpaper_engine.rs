@@ -32,8 +32,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     IsWindow, IsWindowVisible, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos,
 };
 
-const JPEG_QUALITY: i32 = 90;
-const FRAME_INTERVAL: Duration = Duration::from_millis(100);
+// Quality 65 did not improve measured playback throughput, but it visibly softened
+// native-resolution wallpapers. Keep the clearer JPEG 80 setting.
+const JPEG_QUALITY: i32 = 80;
+const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 const ENGINE_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const FIRST_FRAME_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -197,7 +199,7 @@ pub(crate) enum SceneCaptureMode {
 impl SceneCaptureMode {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            Self::DesktopSynchronized => "desktop-synchronized",
+            Self::DesktopSynchronized => "desktop-synchronized-offscreen",
         }
     }
 }
@@ -242,20 +244,18 @@ impl SceneWallpaperCapture {
                 "Wallpaper Engine 桌面渲染尺寸异常：{width}x{height}"
             ));
         }
+        // Windows Graphics Capture 不能只抓 Wallpaper Engine 的 WorkerW 子窗口；
+        // 抓它的顶层宿主会把桌面图标一起带入。先把同一壁纸同步到桌面，再打开一个
+        // 移出可见区域的 playInWindow 供 ChatGPT 捕获。配合 ChatGPT.exe 的“最大化时
+        // 暂停”规则，桌面副本此时不继续渲染，因此不会同时跑两份动态壁纸。
         let (window_name, hwnd) =
             open_independent_wallpaper(&engine, &project_json, width, height)?;
-        let (graphics_state, graphics_control) = match start_graphics_capture(hwnd) {
-            Ok(capture) => capture,
-            Err(error) => {
-                close_wallpaper_window(&engine, &window_name);
-                return Err(error);
-            }
-        };
+        let (graphics_state, graphics_control) = start_graphics_capture(hwnd)?;
         if !wait_for_non_black_graphics_frame(&graphics_state, FIRST_FRAME_ATTEMPT_TIMEOUT) {
             let _ = graphics_control.stop();
             close_wallpaper_window(&engine, &window_name);
             return Err(
-                "Wallpaper Engine playInWindow 在 10 秒内没有产生可用画面；若出现“安全启动”，请先在 Wallpaper Engine 中确认恢复。ReTheme 没有关闭“防止崩溃”保护。"
+                "Wallpaper Engine 独立渲染窗口在 10 秒内没有产生可用画面；若出现“安全启动”，请先在 Wallpaper Engine 中确认恢复。ReTheme 没有关闭“防止崩溃”保护。"
                     .into(),
             );
         }
@@ -755,6 +755,15 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "windows")]
+    fn captures_scene_frames_at_thirty_fps() {
+        assert_eq!(
+            SceneWallpaperCapture::frame_interval(),
+            Duration::from_millis(33)
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
     fn detects_effectively_black_bgra_frames() {
         assert!(bgra_frame_is_effectively_black(&vec![0; 300 * 300 * 4]));
         assert!(bgra_frame_is_effectively_black(&vec![3; 300 * 300 * 4]));
@@ -779,6 +788,7 @@ mod tests {
         let mut worker = SceneWallpaperCapture::capture_worker();
         let mut durations = Vec::new();
         let mut sizes = Vec::new();
+        let mut sequences = Vec::new();
         for _ in 0..30 {
             std::thread::sleep(SceneWallpaperCapture::frame_interval());
             let started = Instant::now();
@@ -792,16 +802,19 @@ mod tests {
             }
             durations.push(started.elapsed().as_secs_f64() * 1000.0);
             sizes.push(frame.jpeg.len());
+            sequences.push(frame.sequence);
         }
         durations.sort_by(f64::total_cmp);
         sizes.sort_unstable();
         let average = durations.iter().sum::<f64>() / durations.len() as f64;
         let p95 = durations[(durations.len() * 95 / 100).min(durations.len() - 1)];
         let average_size = sizes.iter().sum::<usize>() / sizes.len();
+        sequences.dedup();
         eprintln!(
-            "Scene capture: avg={average:.1} ms p95={p95:.1} ms max={:.1} ms avg_size={} KiB",
+            "Scene capture: avg={average:.1} ms p95={p95:.1} ms max={:.1} ms avg_size={} KiB unique_frames={}",
             durations.last().copied().unwrap_or_default(),
-            average_size / 1024
+            average_size / 1024,
+            sequences.len()
         );
     }
 }

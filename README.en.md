@@ -14,7 +14,7 @@ This project is not affiliated with or endorsed by the upstream ReTheme project,
 - Removes opaque frames and composer shadows across current and older ChatGPT views.
 - Supports GitHub-based compatibility checks and signed application updates.
 
-Scene wallpapers currently use Windows Graphics Capture followed by a JPEG frame bridge into ChatGPT. Version 0.4.7 intentionally targets about 10 FPS to bound CPU, GPU, and transport cost. Video and Web wallpapers do not use this Scene capture limit.
+Scene wallpapers are first synchronized to the Wallpaper Engine desktop, then Windows Graphics Capture captures a clean offscreen view of the same project for ChatGPT. Version 0.4.8 preserves the native 2561×1601 size at JPEG quality 80 and measured 15.0 FPS with an original Scene on this machine. Video and Web wallpapers do not use this Scene capture limit. To avoid rendering the same wallpaper twice, configure a Wallpaper Engine application rule that pauses wallpapers when `ChatGPT.exe` is maximized.
 
 ## Requirements
 
