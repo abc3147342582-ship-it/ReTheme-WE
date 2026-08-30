@@ -2,6 +2,13 @@
 
 All notable ReTheme desktop changes are documented here.
 
+## [0.4.9] - 2026-08-30
+
+### Release
+
+- Pin the GitHub Windows build to the locally verified `windows-2022` environment and explicitly generate the NSIS installer, updater manifest, signature assets, and SHA-256 checksums.
+- Surface the final build log lines on failure instead of exposing only a generic wrapper exit code.
+
 ## [0.4.8] - 2026-08-29
 
 ### Fixed

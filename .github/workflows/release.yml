@@ -21,7 +21,7 @@ concurrency:
 jobs:
   windows:
     name: 构建、签名并发布 Windows 更新
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -73,23 +73,85 @@ jobs:
           pnpm test
           cargo test --manifest-path src-tauri/Cargo.toml
 
-      - name: 构建签名安装包并发布 GitHub Release
-        uses: tauri-apps/tauri-action@v1
+      - name: 构建签名 NSIS 安装包
+        id: bundle
+        shell: pwsh
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
-        with:
-          tagName: v${{ steps.version.outputs.version }}
-          releaseName: ReTheme WE v${{ steps.version.outputs.version }}
-          releaseBody: |
-            ReTheme WE v${{ steps.version.outputs.version }} Windows 自动更新包。
-            更新包由 ReTheme WE 独立密钥签名，客户端会在安装前验证签名。
-          releaseDraft: false
-          prerelease: false
-          updaterJsonPreferNsis: true
-          releaseAssetNamePattern: "ReTheme-WE-[platform]-[arch][setup][ext]"
-          args: --bundles nsis
+        run: |
+          pnpm tauri build --bundles nsis 2>&1 | Tee-Object -FilePath tauri-build.log
+          $buildExitCode = $LASTEXITCODE
+          if ($buildExitCode -ne 0) {
+            $tail = (Get-Content -LiteralPath tauri-build.log | Select-Object -Last 80) -join "`n"
+            Write-Error "Tauri NSIS 构建失败，末尾日志：`n$tail"
+            exit $buildExitCode
+          }
+
+      - name: 生成更新清单与校验和
+        id: assets
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $bundleDirectory = Resolve-Path "src-tauri/target/release/bundle/nsis"
+          $installer = Get-ChildItem -LiteralPath $bundleDirectory -Filter "*-setup.exe" | Select-Object -First 1
+          if (-not $installer) {
+            throw "未找到 NSIS 安装包"
+          }
+          $signaturePath = "$($installer.FullName).sig"
+          if (-not (Test-Path -LiteralPath $signaturePath)) {
+            throw "未找到 Tauri 更新签名：$signaturePath"
+          }
+          $releaseDirectory = New-Item -ItemType Directory -Path release-assets -Force
+          $releaseInstaller = Join-Path $releaseDirectory "ReTheme-WE-windows-x64-setup.exe"
+          $releaseSignature = "$releaseInstaller.sig"
+          Copy-Item -LiteralPath $installer.FullName -Destination $releaseInstaller
+          Copy-Item -LiteralPath $signaturePath -Destination $releaseSignature
+          $installerHash = (Get-FileHash -LiteralPath $releaseInstaller -Algorithm SHA256).Hash
+          $signatureHash = (Get-FileHash -LiteralPath $releaseSignature -Algorithm SHA256).Hash
+          @(
+            "$installerHash *ReTheme-WE-windows-x64-setup.exe"
+            "$signatureHash *ReTheme-WE-windows-x64-setup.exe.sig"
+          ) | Set-Content -LiteralPath (Join-Path $releaseDirectory "SHA256SUMS.txt") -Encoding utf8
+          $signature = (Get-Content -LiteralPath $releaseSignature -Raw).Trim()
+          $latest = [ordered]@{
+            version = $version
+            notes = "ReTheme WE $version：稳定单窗口启动，选中 Scene 同步到 Wallpaper Engine 桌面，并提高原生分辨率动态壁纸播放流畅度。"
+            pub_date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            platforms = [ordered]@{
+              "windows-x86_64" = [ordered]@{
+                signature = $signature
+                url = "https://github.com/${{ github.repository }}/releases/download/v$version/ReTheme-WE-windows-x64-setup.exe"
+              }
+            }
+          }
+          $latest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $releaseDirectory "latest.json") -Encoding utf8
+          @"
+          # ReTheme WE $version
+
+          - 修复自动自检、主题应用与 Wallpaper Engine 应用并发打开多个 ChatGPT 页面。
+          - 选择 Scene 时同步为 Wallpaper Engine 桌面壁纸；ChatGPT 最大化时配合应用规则只保留一个活动渲染实例。
+          - Scene 保留 2561×1601 原生尺寸和 JPEG 80，本机原版 Scene 实测 15.0 FPS。
+          - 安装模式为当前用户，不写入 WindowsApps，不关闭安全功能。
+
+          Windows Authenticode 状态仍为 NotSigned；客户端自动更新会验证随附的 Tauri 更新签名。
+          "@ | Set-Content -LiteralPath (Join-Path $releaseDirectory "RELEASE_NOTES.md") -Encoding utf8
+
+      - name: 发布 GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          gh release create "v$version" `
+            "release-assets/ReTheme-WE-windows-x64-setup.exe" `
+            "release-assets/ReTheme-WE-windows-x64-setup.exe.sig" `
+            "release-assets/latest.json" `
+            "release-assets/SHA256SUMS.txt" `
+            --repo "${{ github.repository }}" `
+            --title "ReTheme WE $version" `
+            --notes-file "release-assets/RELEASE_NOTES.md" `
+            --verify-tag
 
       - name: 清理生成配置
         if: always()

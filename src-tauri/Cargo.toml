@@ -1,6 +1,6 @@
 [package]
 name = "retheme-we"
-version = "0.4.8"
+version = "0.4.9"
 description = "A local Wallpaper Engine theme build for ChatGPT"
 authors = ["ReTheme"]
 license = "BSD-3-Clause"

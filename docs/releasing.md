@@ -16,9 +16,9 @@
 可以推送 SemVer 标签：
 
 ```text
-git tag v0.4.8
+git tag v0.4.9
 git push origin main
-git push origin v0.4.8
+git push origin v0.4.9
 ```
 
 也可以从 GitHub Actions 手动运行 `Release ReTheme WE` 并填写版本号。工作流会同步所有版本文件、运行前端与 Rust 测试、构建签名 NSIS 安装包并发布公开 Release。
