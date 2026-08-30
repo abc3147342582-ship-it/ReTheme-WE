@@ -1,0 +1,4 @@
+# Reuse one Cargo cache for local tests and Tauri release builds.
+# Avoid setting per-command CARGO_TARGET_DIR values, which duplicate dependencies.
+[build]
+target-dir = "src-tauri/target"

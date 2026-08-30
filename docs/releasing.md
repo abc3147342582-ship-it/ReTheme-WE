@@ -26,6 +26,10 @@ Windows 工作流只从 NASM 官方发布目录下载 3.02 Win64 压缩包，并
 
 ## 本机预检
 
+项目根目录的 `.cargo/config.toml` 已将所有 Rust/Tauri 构建统一到
+`src-tauri/target`。本机调试、测试与 Release 应复用这一个缓存目录，
+不要再为单次测试设置新的 `CARGO_TARGET_DIR`，否则会重复保存数 GiB 的依赖和调试符号。
+
 ```text
 pnpm install --frozen-lockfile
 pnpm test
